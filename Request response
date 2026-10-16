@@ -1,0 +1,1132 @@
+phonepe:
+  merchant-id: ${PHONEPE_MERCHANT_ID}
+  salt-key: ${PHONEPE_SALT_KEY}
+  salt-index: ${PHONEPE_SALT_INDEX}
+  base-url: https://api.phonepe.com
+  debit-path: /apis/hermes/v4/debit
+  status-base-url: https://api.phonepe.com/apis/pg
+  status-path: /v4/transaction/%s/%s/status
+  callback-url: ${PHONEPE_CALLBACK_URL}
+
+
+package com.epay.payment.config;
+
+import jakarta.validation.constraints.NotBlank;
+import lombok.Getter;
+import lombok.Setter;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.stereotype.Component;
+import org.springframework.validation.annotation.Validated;
+
+@Getter
+@Setter
+@Validated
+@Component
+@ConfigurationProperties(prefix = "phonepe")
+public class PhonePeProperties {
+    @NotBlank private String merchantId;
+    @NotBlank private String saltKey;
+    @NotBlank private String saltIndex;
+    @NotBlank private String baseUrl;
+    @NotBlank private String debitPath;
+    @NotBlank private String statusBaseUrl;
+    @NotBlank private String statusPath;
+    @NotBlank private String callbackUrl;
+}
+
+
+
+
+
+package com.epay.payment.util;
+
+import com.epay.payment.model.phonepe.PhonePePaymentState;
+
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.Base64;
+import java.util.HexFormat;
+
+public final class PhonePeUtil {
+
+    private static final String SEPARATOR = "###";
+    private static final BigDecimal HUNDRED = BigDecimal.valueOf(100);
+
+    private PhonePeUtil() {
+    }
+
+    // debit: JSON -> base64
+    public static String toBase64(String value) {
+        return Base64.getEncoder().encodeToString(value.getBytes(StandardCharsets.UTF_8));
+    }
+
+    // debit X-VERIFY: SHA256(base64Payload + path + saltKey) + "###" + saltIndex
+    public static String debitChecksum(String base64Payload, String path, String saltKey, String saltIndex) {
+        return sha256Hex(base64Payload + path + saltKey) + SEPARATOR + saltIndex;
+    }
+
+    // status X-VERIFY: SHA256(path + saltKey) + "###" + saltIndex
+    public static String statusChecksum(String path, String saltKey, String saltIndex) {
+        return sha256Hex(path + saltKey) + SEPARATOR + saltIndex;
+    }
+
+    // webhook X-VERIFY: SHA256(rawBody + saltKey) + "###" + saltIndex (confirm with PhonePe)
+    public static String webhookChecksum(String rawBody, String saltKey, String saltIndex) {
+        return sha256Hex(rawBody + saltKey) + SEPARATOR + saltIndex;
+    }
+
+    // constant-time compare
+    public static boolean safeEquals(String expected, String actual) {
+        if (expected == null || actual == null) {
+            return false;
+        }
+        return MessageDigest.isEqual(
+                expected.getBytes(StandardCharsets.UTF_8),
+                actual.getBytes(StandardCharsets.UTF_8));
+    }
+
+    // rupees (DB) -> paise (PhonePe)
+    public static long rupeesToPaise(BigDecimal rupees) {
+        if (rupees == null || rupees.signum() <= 0) {
+            throw new IllegalArgumentException("Amount must be greater than zero");
+        }
+        return rupees.multiply(HUNDRED).setScale(0, RoundingMode.UNNECESSARY).longValueExact();
+    }
+
+    // paise (PhonePe) -> rupees (DB)
+    public static BigDecimal paiseToRupees(long paise) {
+        return BigDecimal.valueOf(paise).divide(HUNDRED, 2, RoundingMode.UNNECESSARY);
+    }
+
+    // status path from template /v4/transaction/%s/%s/status
+    public static String buildStatusPath(String template, String merchantId, String transactionId) {
+        return String.format(template, merchantId, transactionId);
+    }
+
+    // PhonePe code -> our state (null for BAD_REQUEST, AUTHORIZATION_FAILED, etc.)
+    public static PhonePePaymentState toPaymentState(String code) {
+        if (code == null) {
+            return null;
+        }
+        return switch (code) {
+            case "PAYMENT_SUCCESS" -> PhonePePaymentState.SUCCESS;
+            case "PAYMENT_PENDING" -> PhonePePaymentState.PENDING;
+            case "PAYMENT_ERROR", "PAYMENT_DECLINED" -> PhonePePaymentState.FAILED;
+            case "TRANSACTION_NOT_FOUND" -> PhonePePaymentState.NOT_FOUND;
+            default -> null;
+        };
+    }
+
+    private static String sha256Hex(String input) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            return HexFormat.of().formatHex(digest.digest(input.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 not available", e);
+        }
+    }
+}
+
+package com.epay.payment.service;
+
+import io.netty.handler.ssl.SslContext;
+import io.netty.handler.ssl.SslContextBuilder;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.MediaType;
+import org.springframework.http.client.reactive.ReactorClientHttpConnector;
+import org.springframework.stereotype.Service;
+import org.springframework.web.reactive.function.client.ClientResponse;
+import org.springframework.web.reactive.function.client.WebClient;
+import reactor.core.publisher.Mono;
+import reactor.netty.http.client.HttpClient;
+import reactor.netty.transport.ProxyProvider;
+
+import javax.net.ssl.SSLException;
+import java.util.Map;
+
+/**
+ * Copyright (c) 2026 [State Bank of India]
+ * All rights reserved
+ *
+ * Version:1.0
+ */
+@Service
+public class PhonePeWebClientService {
+
+    LoggerUtility logger = LoggerFactoryUtility.getLogger(this.getClass());
+
+    // copy these two fields exactly as declared in PayPalWebClientService
+    @Value("${https.proxyHost}")
+    private String https_proxyHost;
+
+    @Value("${https.proxyPort}")
+    private String https_proxyPort;
+
+    /**
+     * @Method-Description: Single generic PhonePe call, used for V4 debit (POST) and V4 status (GET)
+     * @param: httpMethod POST or GET
+     * @param: url full URL
+     * @param: requestPayload JSON body, null for GET
+     * @param: responseDto class to read the response into
+     * @param: requestHeaders X-VERIFY, X-CALLBACK-URL, etc. (a Content-Type here replaces the JSON default)
+     * @return T
+     * @Exception: PaymentException
+     */
+    public <T> T initiatePhonePeWebClient(HttpMethod httpMethod, String url, String requestPayload,
+                                          Class<T> responseDto, Map<String, String> requestHeaders) {
+        logger.info("PhonePe {} URL :: {} ", httpMethod, url);
+        try {
+            WebClient.RequestBodySpec requestSpec = buildWebClient(url)
+                    .method(httpMethod)
+                    .headers(httpHeaders -> {
+                        if (requestHeaders != null) {
+                            requestHeaders.forEach(httpHeaders::set);
+                        }
+                    });
+            WebClient.RequestHeadersSpec<?> request =
+                    requestPayload == null ? requestSpec : requestSpec.bodyValue(requestPayload);
+
+            return request.retrieve()
+                    .onStatus(status -> {
+                        logger.info("PhonePe Response-code received :: {} ", status);
+                        return !status.is2xxSuccessful();
+                    }, this::handleError)
+                    .bodyToMono(responseDto)
+                    .doOnNext(body -> logger.info("PhonePe response received and processing"))
+                    .doOnError(PaymentException.class, error ->
+                            logger.error("Error while getting PhonePe Response :: {} ", error.getErrorMessage()))
+                    .block();
+        } catch (PaymentException e) {
+            throw e;
+        } catch (Exception e) {
+            logger.error("PhonePe call failed :: {} ", e.getMessage());
+            throw new PaymentException(ErrorConstants.EXTERNAL_SERVICE_ERROR_CODE, "PhonePe service call failed");
+        }
+    }
+
+    private WebClient buildWebClient(String url) throws SSLException {
+        SslContext sslContextForTls12 = SslContextBuilder.forClient()
+                .protocols(PaymentConstants.protocols)
+                .build();
+
+        HttpClient httpClient =
+                HttpClient.create()
+                        .proxy(proxy -> proxy.type(ProxyProvider.Proxy.HTTP)
+                                .host(https_proxyHost)
+                                .port(Integer.parseInt(https_proxyPort)))
+                        .secure(ssl -> ssl.sslContext(sslContextForTls12));
+
+        return WebClient.builder().baseUrl(url)
+                .clientConnector(new ReactorClientHttpConnector(httpClient))
+                .defaultHeader(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
+                .build();
+    }
+
+    private Mono<? extends Throwable> handleError(ClientResponse clientResponse) {
+        return clientResponse.bodyToMono(String.class)
+                .defaultIfEmpty("")
+                .flatMap(errorBody -> {
+                    int statusCode = clientResponse.statusCode().value();
+                    logger.error("PhonePe Error Map:: statusCode :: {} ", statusCode);
+                    logger.error("PhonePe Error Map:: errorBody :: {} ", errorBody);
+                    return Mono.<Throwable>error(new PaymentException(
+                            ErrorConstants.EXTERNAL_SERVICE_ERROR_CODE,
+                            "PhonePe service returned status " + statusCode));
+                });
+    }
+}
+
+
+
+
+package com.epay.payment.model.phonepe.request;
+
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.google.gson.annotations.SerializedName;
+import jakarta.validation.constraints.NotBlank;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.io.Serializable;
+
+/**
+ * Copyright (c) 2026 [State Bank of India]
+ * All rights reserved
+ *
+ * Version:1.0
+ */
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+@Builder
+public class PhonePeInitiationRequest implements Serializable {
+
+    @NotBlank(message = "atrn is required")
+    @SerializedName(value = "atrn")
+    @JsonProperty(value = "atrn")
+    private String atrn;
+}
+
+
+
+
+                               package com.epay.payment.model.phonepe.request;
+
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.google.gson.annotations.SerializedName;
+import jakarta.validation.constraints.NotBlank;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.io.Serializable;
+
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+@Builder
+public class PhonePeStatusRequest implements Serializable {
+
+    @NotBlank(message = "atrn is required")
+    @SerializedName(value = "atrn")
+    @JsonProperty(value = "atrn")
+    private String atrn;
+}
+
+
+
+                              package com.epay.payment.model.phonepe.request;
+
+import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.google.gson.annotations.SerializedName;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.io.Serializable;
+
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+@Builder
+@JsonInclude(JsonInclude.Include.NON_NULL)
+public class PhonePeDebitRequest implements Serializable {
+
+    @SerializedName(value = "merchantId")
+    @JsonProperty(value = "merchantId")
+    private String merchantId;
+
+    // optional, aggregator cases only
+    @SerializedName(value = "subMerchantId")
+    @JsonProperty(value = "subMerchantId")
+    private String subMerchantId;
+
+    // your ATRN, 1 to 38 characters
+    @SerializedName(value = "transactionId")
+    @JsonProperty(value = "transactionId")
+    private String transactionId;
+
+    // in paise
+    @SerializedName(value = "amount")
+    @JsonProperty(value = "amount")
+    private Long amount;
+
+    // optional
+    @SerializedName(value = "mcc")
+    @JsonProperty(value = "mcc")
+    private String mcc;
+
+    @SerializedName(value = "merchantUserId")
+    @JsonProperty(value = "merchantUserId")
+    private String merchantUserId;
+
+    @SerializedName(value = "mobileNumber")
+    @JsonProperty(value = "mobileNumber")
+    private String mobileNumber;
+
+    @SerializedName(value = "message")
+    @JsonProperty(value = "message")
+    private String message;
+
+    @SerializedName(value = "email")
+    @JsonProperty(value = "email")
+    private String email;
+
+    // must be PHONEPE for PPE intent
+    @SerializedName(value = "paymentScope")
+    @JsonProperty(value = "paymentScope")
+    private String paymentScope;
+}
+
+
+
+
+
+                                  package com.epay.payment.model.phonepe.request;
+
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.google.gson.annotations.SerializedName;
+import jakarta.validation.constraints.NotBlank;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.io.Serializable;
+
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+@Builder
+public class PhonePeStatusRequest implements Serializable {
+
+    @NotBlank(message = "atrn is required")
+    @SerializedName(value = "atrn")
+    @JsonProperty(value = "atrn")
+    private String atrn;
+}
+
+
+package com.epay.payment.model.phonepe.request;
+
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.google.gson.annotations.SerializedName;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.io.Serializable;
+
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+@Builder
+public class PhonePeDebitEnvelope implements Serializable {
+
+    @SerializedName(value = "request")
+    @JsonProperty(value = "request")
+    private String request;
+}
+
+
+
+                                  package com.epay.payment.model.phonepe.response;
+
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.google.gson.annotations.SerializedName;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.io.Serializable;
+
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+@Builder
+public class PhonePeResponseDto implements Serializable {
+
+    @SerializedName(value = "atrn")
+    @JsonProperty(value = "atrn")
+    private String atrn;
+
+    @SerializedName(value = "redirectType")
+    @JsonProperty(value = "redirectType")
+    private String redirectType;
+
+    @SerializedName(value = "redirectUrl")
+    @JsonProperty(value = "redirectUrl")
+    private String redirectUrl;
+}
+
+
+
+
+                                  package com.epay.payment.model.phonepe.response;
+
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.google.gson.annotations.SerializedName;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.io.Serializable;
+
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+@Builder
+public class PhonePeStatusResponseDto implements Serializable {
+
+    @SerializedName(value = "atrn")
+    @JsonProperty(value = "atrn")
+    private String atrn;
+
+    // SUCCESS, PENDING, FAILED, NOT_FOUND, UNKNOWN
+    @SerializedName(value = "paymentStatus")
+    @JsonProperty(value = "paymentStatus")
+    private String paymentStatus;
+
+    @SerializedName(value = "phonePeCode")
+    @JsonProperty(value = "phonePeCode")
+    private String phonePeCode;
+
+    @SerializedName(value = "providerReferenceId")
+    @JsonProperty(value = "providerReferenceId")
+    private String providerReferenceId;
+}
+
+
+
+                                  package com.epay.payment.model.phonepe.response;
+
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.google.gson.annotations.SerializedName;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.io.Serializable;
+
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+@Builder
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class PhonePeDebitResponse implements Serializable {
+
+    @SerializedName(value = "success")
+    @JsonProperty(value = "success")
+    private boolean success;
+
+    @SerializedName(value = "code")
+    @JsonProperty(value = "code")
+    private String code;
+
+    @SerializedName(value = "message")
+    @JsonProperty(value = "message")
+    private String message;
+
+    @SerializedName(value = "data")
+    @JsonProperty(value = "data")
+    private PhonePeDebitResponseData data;
+}
+
+
+
+                                  
+                    package com.epay.payment.model.phonepe.response;
+
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.google.gson.annotations.SerializedName;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.io.Serializable;
+
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+@Builder
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class PhonePeDebitResponseData implements Serializable {
+
+    // INTENT
+    @SerializedName(value = "redirectType")
+    @JsonProperty(value = "redirectType")
+    private String redirectType;
+
+    // ppe://pay?...
+    @SerializedName(value = "redirectURL")
+    @JsonProperty(value = "redirectURL")
+    private String redirectURL;
+}
+
+
+
+
+                                  package com.epay.payment.model.phonepe.response;
+
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.google.gson.annotations.SerializedName;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.io.Serializable;
+
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+@Builder
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class PhonePeTransactionStatusResponse implements Serializable {
+
+    @SerializedName(value = "success")
+    @JsonProperty(value = "success")
+    private boolean success;
+
+    // PAYMENT_SUCCESS, PAYMENT_PENDING, PAYMENT_ERROR, PAYMENT_DECLINED, TRANSACTION_NOT_FOUND, ...
+    @SerializedName(value = "code")
+    @JsonProperty(value = "code")
+    private String code;
+
+    @SerializedName(value = "message")
+    @JsonProperty(value = "message")
+    private String message;
+
+    @SerializedName(value = "data")
+    @JsonProperty(value = "data")
+    private PhonePeTransactionStatusData data;
+}
+
+
+
+
+                                  package com.epay.payment.model.phonepe.response;
+
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.google.gson.annotations.SerializedName;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.io.Serializable;
+
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+@Builder
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class PhonePePaymentMode implements Serializable {
+
+    // common to all modes
+    @SerializedName(value = "mode")
+    @JsonProperty(value = "mode")
+    private String mode;
+
+    @SerializedName(value = "amount")
+    @JsonProperty(value = "amount")
+    private Long amount;
+
+    @SerializedName(value = "processingRail")
+    @JsonProperty(value = "processingRail")
+    private String processingRail;
+
+    // ACCOUNT and EXTERNAL_VPA
+    @SerializedName(value = "vpa")
+    @JsonProperty(value = "vpa")
+    private String vpa;
+
+    @SerializedName(value = "maskedAccountNumber")
+    @JsonProperty(value = "maskedAccountNumber")
+    private String maskedAccountNumber;
+
+    @SerializedName(value = "ifsc")
+    @JsonProperty(value = "ifsc")
+    private String ifsc;
+
+    @SerializedName(value = "utr")
+    @JsonProperty(value = "utr")
+    private String utr;
+
+    @SerializedName(value = "accountHolderName")
+    @JsonProperty(value = "accountHolderName")
+    private String accountHolderName;
+
+    @SerializedName(value = "accountType")
+    @JsonProperty(value = "accountType")
+    private String accountType;
+
+    @SerializedName(value = "bankId")
+    @JsonProperty(value = "bankId")
+    private String bankId;
+
+    @SerializedName(value = "upiTransactionId")
+    @JsonProperty(value = "upiTransactionId")
+    private String upiTransactionId;
+
+    @SerializedName(value = "cardVariant")
+    @JsonProperty(value = "cardVariant")
+    private String cardVariant;
+
+    // CREDIT_CARD and DEBIT_CARD
+    @SerializedName(value = "pgTransactionId")
+    @JsonProperty(value = "pgTransactionId")
+    private String pgTransactionId;
+
+    @SerializedName(value = "bankTransactionId")
+    @JsonProperty(value = "bankTransactionId")
+    private String bankTransactionId;
+
+    @SerializedName(value = "arn")
+    @JsonProperty(value = "arn")
+    private String arn;
+
+    @SerializedName(value = "maskedCardNumber")
+    @JsonProperty(value = "maskedCardNumber")
+    private String maskedCardNumber;
+
+    @SerializedName(value = "cardHolderName")
+    @JsonProperty(value = "cardHolderName")
+    private String cardHolderName;
+
+    @SerializedName(value = "cardBin")
+    @JsonProperty(value = "cardBin")
+    private String cardBin;
+
+    @SerializedName(value = "geoScope")
+    @JsonProperty(value = "geoScope")
+    private String geoScope;
+
+    @SerializedName(value = "internationalCardFlowType")
+    @JsonProperty(value = "internationalCardFlowType")
+    private String internationalCardFlowType;
+
+    // ACCOUNT, CARD, EXTERNAL_VPA
+    @SerializedName(value = "cardNetwork")
+    @JsonProperty(value = "cardNetwork")
+    private String cardNetwork;
+
+    // WALLET and EGV
+    @SerializedName(value = "referenceId")
+    @JsonProperty(value = "referenceId")
+    private String referenceId;
+}
+
+
+
+
+
+
+                                  package com.epay.payment.validator;
+
+import org.springframework.stereotype.Component;
+
+import java.math.BigDecimal;
+import java.text.MessageFormat;
+
+import static com.epay.payment.util.PaymentConstants.ATRN_LENGTH;
+
+@Component
+public class PhonePeValidator extends BaseValidator {
+
+    private final LoggerUtility logger = LoggerFactoryUtility.getLogger(this.getClass());
+
+    public void validatePhonePeAuthRequest(PaymentInitiationRequest paymentInitiationRequest) {
+        errorDtoList.clear();
+        checkForLeadingTrailingAndSingleSpace(paymentInitiationRequest.getAtrn(), PaymentConstants.ATRN_CONST);
+        validateFieldLength(paymentInitiationRequest.getAtrn(), ATRN_LENGTH, PaymentConstants.ATRN_CONST);
+        validateFieldWithRegex(paymentInitiationRequest.getAtrn(), PaymentConstants.ATRN_ARRN_REGEX_DIGIT,
+                PaymentConstants.ATRN_CONST, PaymentConstants.INVALID_ATRN_CONST);
+    }
+
+    public void validateDebitAmount(BigDecimal debitAmt, String value) {
+        errorDtoList.clear();
+        BigDecimal paidAmount = toBigDecimal(value);
+        if (debitAmt == null || paidAmount == null || debitAmt.compareTo(paidAmount) != 0) {
+            addError(ErrorConstants.INVALID_ERROR_CODE, MessageFormat.format(ErrorConstants.INVALID_ERROR_MESSAGE,
+                    PaymentConstants.DEBIT_AMOUNT_CONST, PaymentConstants.DEBIT_AMOUNT_MISMATCH_CONST));
+        }
+    }
+
+    public void validateCurrencyCode(String currencyCode) {
+        errorDtoList.clear();
+        boolean inr = PaymentConstants.INR_CURRENCY.equalsIgnoreCase(currencyCode);
+        if (!inr) {
+            addError(ErrorConstants.INVALID_ERROR_CODE, MessageFormat.format(ErrorConstants.INVALID_ERROR_MESSAGE,
+                    PaymentConstants.CURRENCY_CONST, PaymentConstants.INR_CURRENCY));
+        }
+    }
+
+    private BigDecimal toBigDecimal(String value) {
+        try {
+            return value == null ? null : new BigDecimal(value.trim());
+        } catch (NumberFormatException e) {
+            logger.info("Invalid amount value received :: {} ", value);
+            return null;
+        }
+    }
+}
+
+
+
+                                  
+package com.epay.payment.service;
+
+import com.epay.payment.config.PhonePeProperties;
+import com.epay.payment.model.phonepe.PhonePePaymentState;
+import com.epay.payment.model.phonepe.request.PhonePeDebitEnvelope;
+import com.epay.payment.model.phonepe.request.PhonePeDebitRequest;
+import com.epay.payment.model.phonepe.request.PhonePeInitiationRequest;
+import com.epay.payment.model.phonepe.request.PhonePeStatusRequest;
+import com.epay.payment.model.phonepe.response.PhonePeDebitResponse;
+import com.epay.payment.model.phonepe.response.PhonePeResponseDto;
+import com.epay.payment.model.phonepe.response.PhonePeStatusResponseDto;
+import com.epay.payment.model.phonepe.response.PhonePeTransactionStatusData;
+import com.epay.payment.model.phonepe.response.PhonePeTransactionStatusResponse;
+import com.epay.payment.util.PhonePeUtil;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpMethod;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Copyright (c) 2026 [State Bank of India]
+ * All rights reserved
+ *
+ * Version:1.0
+ */
+@Service
+@RequiredArgsConstructor
+public class PhonePeService {
+
+    private final LoggerUtility logger = LoggerFactoryUtility.getLogger(this.getClass());
+    private static final String PAYMENT_SCOPE = "PHONEPE";
+
+    private final PaymentValidator paymentValidator;
+    private final PhonePeValidator phonePeValidator;
+    private final PhonePeWebClientService phonePeWebClientService;
+    private final PhonePeDao phonePeDao;
+    private final PhonePeProperties properties;
+    private final ObjectMapper objectMapper;
+
+    // ---------------------------------------------------------------
+    // 1. INITIATE: POST /api/v1/phonepe/initiate -> PhonePe POST /v4/debit
+    // ---------------------------------------------------------------
+
+    /**
+     * @Method-Description: Process PhonePe V4 debit initiation
+     * @param: phonePeInitiationRequest
+     * @Exception: or @Error :Exception
+     */
+    @Transactional
+    public PaymentResponse<?> initiatePayment(PhonePeInitiationRequest phonePeInitiationRequest) {
+        //Validate PhonePe request
+        phonePeValidator.validatePhonePeAuthRequest(getPaymentInitiationRequest(phonePeInitiationRequest.getAtrn()));
+        logger.info("Payment Initiation Request validated successfully for Atrn :: {} ", phonePeInitiationRequest.getAtrn());
+
+        TransactionDto transactionDto = phonePeDao.getTransactionForInitiation(phonePeInitiationRequest.getAtrn());
+        logger.info("Payment Initiation get atrn details transactionDto:: {} ", transactionDto);
+
+        //validate debit amount
+        paymentValidator.validateDebitAmount(transactionDto.getDebitAmt());
+        //validate currency code (PhonePe supports INR only)
+        phonePeValidator.validateCurrencyCode(transactionDto.getCurrencyCode());
+        logger.info("Amount validated successfully :: {}", transactionDto.getDebitAmt());
+
+        PhonePeDebitResponse phonePeDebitResponse = processDebitRequest(transactionDto);
+        logger.info("PhonePe Debit Response code {} for reference no {} ",
+                phonePeDebitResponse.getCode(), transactionDto.getAtrnNum());
+
+        PhonePeResponseDto phonePeResponseDto = PhonePeResponseDto.builder()
+                .atrn(transactionDto.getAtrnNum())
+                .redirectType(phonePeDebitResponse.getData().getRedirectType())
+                .redirectUrl(phonePeDebitResponse.getData().getRedirectURL())
+                .build();
+        logger.info("PhonePe- phonePeResponseDto: {}", phonePeResponseDto);
+
+        return PaymentResponse.builder()
+                .data(List.of(phonePeResponseDto))
+                .status(PaymentConstants.API_RESPONSE_STATUS_SUCCESS)
+                .build();
+    }
+
+    private PhonePeDebitResponse processDebitRequest(TransactionDto transactionDto) {
+        PhonePeDebitRequest debitRequest = PhonePeDebitRequest.builder()
+                .merchantId(properties.getMerchantId())
+                .transactionId(transactionDto.getAtrnNum())
+                .amount(PhonePeUtil.rupeesToPaise(transactionDto.getDebitAmt()))
+                .paymentScope(PAYMENT_SCOPE)
+                .build();
+
+        String base64Payload = PhonePeUtil.toBase64(toJson(debitRequest));
+        String requestPayload = toJson(new PhonePeDebitEnvelope(base64Payload));
+
+        Map<String, String> requestHeaders = new HashMap<>();
+        requestHeaders.put("X-VERIFY", PhonePeUtil.debitChecksum(
+                base64Payload, properties.getDebitPath(), properties.getSaltKey(), properties.getSaltIndex()));
+        requestHeaders.put("X-CALLBACK-URL", properties.getCallbackUrl());
+
+        PhonePeDebitResponse response = phonePeWebClientService.initiatePhonePeWebClient(
+                HttpMethod.POST, properties.getBaseUrl() + properties.getDebitPath(),
+                requestPayload, PhonePeDebitResponse.class, requestHeaders);
+
+        if (response == null
+                || !response.isSuccess()
+                || response.getData() == null
+                || response.getData().getRedirectURL() == null) {
+            logger.error("PhonePe debit failed for atrn {}", transactionDto.getAtrnNum());
+            throw new PaymentException(ErrorConstants.EXTERNAL_SERVICE_ERROR_CODE,
+                    "PhonePe debit failed: " + (response == null ? "no response" : response.getCode()));
+        }
+        return response;
+    }
+
+    // ---------------------------------------------------------------
+    // 2. WEBHOOK: PhonePe -> POST /api/v1/phonepe/webhook
+    // ---------------------------------------------------------------
+
+    /**
+     * @Method-Description: Process the callback sent by PhonePe after the user pays
+     * @param: rawBody, xVerify
+     * @Exception: or @Error :Exception
+     */
+    @Transactional
+    public void processWebhook(String rawBody, String xVerify) {
+        String expected = PhonePeUtil.webhookChecksum(rawBody, properties.getSaltKey(), properties.getSaltIndex());
+        if (!PhonePeUtil.safeEquals(expected, xVerify)) {
+            logger.error("PhonePe webhook rejected: invalid checksum");
+            throw new PaymentException(ErrorConstants.INVALID_ERROR_CODE, "Invalid webhook checksum");
+        }
+
+        PhonePeTransactionStatusResponse response = parseWebhook(rawBody);
+        if (response.getData() == null || response.getData().getTransactionId() == null) {
+            logger.error("PhonePe webhook without transaction data, code :: {} ", response.getCode());
+            return;
+        }
+
+        String atrn = response.getData().getTransactionId();
+        logger.info("PhonePe webhook received for Atrn :: {} code :: {} ", atrn, response.getCode());
+        processPaymentResult(atrn, response);
+    }
+
+    // ---------------------------------------------------------------
+    // 3. STATUS: POST /api/v1/phonepe/status -> PhonePe GET /v4/transaction/{merchantId}/{atrn}/status
+    // ---------------------------------------------------------------
+
+    /**
+     * @Method-Description: Ask PhonePe for the payment status and update DB
+     * @param: phonePeStatusRequest
+     * @Exception: or @Error :Exception
+     */
+    @Transactional
+    public PaymentResponse<?> getPaymentStatus(PhonePeStatusRequest phonePeStatusRequest) {
+        phonePeValidator.validatePhonePeAuthRequest(getPaymentInitiationRequest(phonePeStatusRequest.getAtrn()));
+        logger.info("PhonePe status request validated successfully for Atrn :: {} ", phonePeStatusRequest.getAtrn());
+
+        String path = PhonePeUtil.buildStatusPath(
+                properties.getStatusPath(), properties.getMerchantId(), phonePeStatusRequest.getAtrn());
+
+        Map<String, String> requestHeaders = new HashMap<>();
+        requestHeaders.put("X-VERIFY",
+                PhonePeUtil.statusChecksum(path, properties.getSaltKey(), properties.getSaltIndex()));
+        // optional headers from the docs (X-PROVIDER-ID, X-CLIENT-ID, X-CLIENT-VERSION) can be added here
+
+        PhonePeTransactionStatusResponse response = phonePeWebClientService.initiatePhonePeWebClient(
+                HttpMethod.GET, properties.getStatusBaseUrl() + path,
+                null, PhonePeTransactionStatusResponse.class, requestHeaders);
+        if (response == null) {
+            throw new PaymentException(ErrorConstants.EXTERNAL_SERVICE_ERROR_CODE, "Empty response from PhonePe");
+        }
+
+        PhonePePaymentState state = processPaymentResult(phonePeStatusRequest.getAtrn(), response);
+
+        PhonePeStatusResponseDto phonePeStatusResponseDto = PhonePeStatusResponseDto.builder()
+                .atrn(phonePeStatusRequest.getAtrn())
+                .paymentStatus(state == null ? "UNKNOWN" : state.name())
+                .phonePeCode(response.getCode())
+                .providerReferenceId(response.getData() == null ? null : response.getData().getProviderReferenceId())
+                .build();
+        logger.info("PhonePe- phonePeStatusResponseDto: {}", phonePeStatusResponseDto);
+
+        return PaymentResponse.builder()
+                .data(List.of(phonePeStatusResponseDto))
+                .status(PaymentConstants.API_RESPONSE_STATUS_SUCCESS)
+                .build();
+    }
+
+    // ---------------------------------------------------------------
+    // Common for webhook and status
+    // ---------------------------------------------------------------
+
+    private PhonePePaymentState processPaymentResult(String atrn, PhonePeTransactionStatusResponse response) {
+        PhonePePaymentState state = PhonePeUtil.toPaymentState(response.getCode());
+        if (state == null || state == PhonePePaymentState.NOT_FOUND) {
+            logger.info("PhonePe result not applied for Atrn :: {} code :: {} ", atrn, response.getCode());
+            return state;
+        }
+
+        TransactionDto transactionDto = phonePeDao.getTransactionByAtrn(atrn);
+        PhonePeTransactionStatusData data = response.getData();
+
+        if (state == PhonePePaymentState.SUCCESS) {
+            if (data == null || data.getPaidAmount() == null) {
+                throw new PaymentException(ErrorConstants.EXTERNAL_SERVICE_ERROR_CODE,
+                        "PhonePe success response without paid amount");
+            }
+            //validate paid amount with the amount saved in DB
+            phonePeValidator.validateDebitAmount(transactionDto.getDebitAmt(),
+                    PhonePeUtil.paiseToRupees(data.getPaidAmount()).toPlainString());
+            logger.info("Paid amount validated successfully for Atrn :: {} ", atrn);
+        }
+
+        boolean updated = phonePeDao.updatePaymentResult(transactionDto, state, response);
+        if (updated && state == PhonePePaymentState.SUCCESS) {
+            phonePeDao.savePaymentModes(transactionDto, data.getPaymentModes());
+        }
+        return state;
+    }
+
+    private PaymentInitiationRequest getPaymentInitiationRequest(String atrn) {
+        // copy the body of your getInitiationPaypalRequest if it sets more fields
+        return PaymentInitiationRequest.builder()
+                .atrn(atrn)
+                .build();
+    }
+
+    private PhonePeTransactionStatusResponse parseWebhook(String rawBody) {
+        try {
+            return objectMapper.readValue(rawBody, PhonePeTransactionStatusResponse.class);
+        } catch (JsonProcessingException e) {
+            logger.error("PhonePe webhook body could not be read");
+            throw new PaymentException(ErrorConstants.INVALID_ERROR_CODE, "Invalid webhook body");
+        }
+    }
+
+    private String toJson(Object value) {
+        try {
+            return objectMapper.writeValueAsString(value);
+        } catch (JsonProcessingException e) {
+            throw new PaymentException(ErrorConstants.EXTERNAL_SERVICE_ERROR_CODE,
+                    "Could not build PhonePe request");
+        }
+    }
+}
+
+
+
+
+
+                                  package com.epay.payment.dao;
+
+import com.epay.payment.model.phonepe.PhonePePaymentState;
+import com.epay.payment.model.phonepe.response.PhonePePaymentMode;
+import com.epay.payment.model.phonepe.response.PhonePeTransactionStatusResponse;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Component;
+
+import java.util.List;
+
+@Component
+@RequiredArgsConstructor
+public class PhonePeDao {
+
+    private final LoggerUtility logger = LoggerFactoryUtility.getLogger(this.getClass());
+
+    private final TransactionDao transactionDao;
+    // your existing JPA repositories (rename to match your project)
+    private final PaymentTransactionRepository paymentTransactionRepository;
+    private final PaymentModeRepository paymentModeRepository;
+
+    /**
+     * Used by /initiate. Works now. Copy the second argument from your PayPal service.
+     */
+    public TransactionDto getTransactionForInitiation(String atrn) {
+        return transactionDao.getValidPaymentAckReq(atrn, PaymentStatus.REPLACE_WITH_PAYPAL_VALUE);
+    }
+
+    /**
+     * Used by webhook and status. TODO: find the payment row by ATRN WITHOUT a status filter, so a repeated
+     * webhook or status call still finds the row after it is already SUCCESS or FAILED.
+     */
+    public TransactionDto getTransactionByAtrn(String atrn) {
+        throw new UnsupportedOperationException("map to your order payment lookup");
+    }
+
+    /**
+     * Used by webhook and status. Return true only when the row was changed. Return false when it is already
+     * SUCCESS or FAILED, so when both webhook and status arrive, the second one does nothing.
+     * TODO: set payment status from state, gateway reference = response.getData().getProviderReferenceId(),
+     * payment time = response.getData().getPaymentTimestamp() (epoch millis), response code. Save it.
+     */
+    public boolean updatePaymentResult(TransactionDto transactionDto, PhonePePaymentState state,
+                                       PhonePeTransactionStatusResponse response) {
+        throw new UnsupportedOperationException("map to your order payment entity");
+    }
+
+    /**
+     * Used by webhook and status after SUCCESS. TODO: one row per PhonePePaymentMode in your pay mode table
+     * (id stays null for insert): mode, amount (PhonePeUtil.paiseToRupees), processingRail, utr, vpa, masked card or account.
+     */
+    public void savePaymentModes(TransactionDto transactionDto, List<PhonePePaymentMode> paymentModes) {
+        throw new UnsupportedOperationException("map to your pay mode entity");
+    }
+}
+
+
+
+
+        package com.epay.payment.controller;
+
+import com.epay.payment.model.phonepe.request.PhonePeInitiationRequest;
+import com.epay.payment.model.phonepe.request.PhonePeStatusRequest;
+import com.epay.payment.service.PhonePeService;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+@RequestMapping("/api/v1/phonepe")
+@RequiredArgsConstructor
+public class PhonePeController {
+
+    private final PhonePeService phonePeService;
+
+    // runs 1st: the user taps Pay
+    @PostMapping("/initiate")
+    public ResponseEntity<PaymentResponse<?>> initiate(
+            @Valid @RequestBody PhonePeInitiationRequest phonePeInitiationRequest) {
+        return ResponseEntity.ok(phonePeService.initiatePayment(phonePeInitiationRequest));
+    }
+
+    // runs automatically: PhonePe calls it after the user pays
+    @PostMapping("/webhook")
+    public ResponseEntity<Void> webhook(@RequestBody String rawBody,
+                                        @RequestHeader(value = "X-VERIFY", required = false) String xVerify) {
+        phonePeService.processWebhook(rawBody, xVerify);
+        return ResponseEntity.ok().build();
+    }
+
+    // runs only when the webhook is late or the result is PENDING
+    @PostMapping("/status")
+    public ResponseEntity<PaymentResponse<?>> status(
+            @Valid @RequestBody PhonePeStatusRequest phonePeStatusRequest) {
+        return ResponseEntity.ok(phonePeService.getPaymentStatus(phonePeStatusRequest));
+    }
+}
+
+                                  
