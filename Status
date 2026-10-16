@@ -1,0 +1,141 @@
+package com.epay.payment.service;
+
+import com.epay.payment.config.PhonePeProperties;
+import com.epay.payment.model.phonepe.PhonePeInitiationRequest;
+import com.epay.payment.model.phonepe.PhonePePaymentState;
+import com.epay.payment.model.phonepe.PhonePeStatusResponseDto;
+import com.epay.payment.model.phonepe.PhonePeTransactionStatusData;
+import com.epay.payment.model.phonepe.PhonePeTransactionStatusResponse;
+import com.epay.payment.util.PhonePeUtil;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpMethod;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * API : API 2 (getPhonePeStatus, GET status) and API 3 (processWebhook, callback from PhonePe)
+ * Copyright (c) 2026 [State Bank of India]
+ * All rights reserved
+ *
+ * Version:1.0
+ */
+@Service
+@RequiredArgsConstructor
+public class PhonePeStatusService {
+
+    private final LoggerUtility logger = LoggerFactoryUtility.getLogger(this.getClass());
+
+    private final PhonePeValidator phonePeValidator;
+    private final PhonePeWebClientService phonePeWebClientService;
+    private final PhonePeDao phonePeDao;
+    private final PhonePeProperties properties;
+    private final ObjectMapper objectMapper;
+
+    /**
+     * API 3: process webhook from PhonePe
+     */
+    @Transactional
+    public void processWebhook(String rawBody, String xVerify) {
+        String expected = PhonePeUtil.webhookChecksum(rawBody, properties.getSaltKey(), properties.getSaltIndex());
+        if (!PhonePeUtil.safeEquals(expected, xVerify)) {
+            logger.error("PhonePe webhook rejected: invalid checksum");
+            throw new PaymentException(ErrorConstants.INVALID_ERROR_CODE, "Invalid webhook checksum");
+        }
+
+        PhonePeTransactionStatusResponse response = parseWebhook(rawBody);
+        if (response.getData() == null || response.getData().getTransactionId() == null) {
+            logger.error("PhonePe webhook without transaction data, code :: {} ", response.getCode());
+            return;
+        }
+
+        String atrn = response.getData().getTransactionId();
+        logger.info("PhonePe webhook received for Atrn :: {} code :: {} ", atrn, response.getCode());
+        processPaymentResult(atrn, response);
+    }
+
+    /**
+     * API 2: check payment status from PhonePe and update DB
+     */
+    @Transactional
+    public PaymentResponse<?> getPhonePeStatus(PhonePeInitiationRequest phonePeInitiationRequest) {
+        PaymentInitiationRequest paymentInitiationRequest = PaymentInitiationRequest.builder()
+                .atrn(phonePeInitiationRequest.getAtrn())
+                .build();
+        phonePeValidator.validatePhonePeAuthRequest(paymentInitiationRequest);
+        logger.info("PhonePe status request validated successfully for Atrn :: {} ", phonePeInitiationRequest.getAtrn());
+
+        String path = PhonePeUtil.buildStatusPath(
+                properties.getStatusPath(), properties.getMerchantId(), phonePeInitiationRequest.getAtrn());
+        Map<String, String> requestHeaders = new HashMap<>();
+        requestHeaders.put("X-VERIFY",
+                PhonePeUtil.statusChecksum(path, properties.getSaltKey(), properties.getSaltIndex()));
+
+        PhonePeTransactionStatusResponse response = phonePeWebClientService.initiatePhonePeWebClient(
+                HttpMethod.GET, properties.getStatusBaseUrl() + path,
+                null, PhonePeTransactionStatusResponse.class, requestHeaders);
+        if (response == null) {
+            throw new PaymentException(ErrorConstants.EXTERNAL_SERVICE_ERROR_CODE, "Empty response from PhonePe");
+        }
+
+        PhonePePaymentState state = processPaymentResult(phonePeInitiationRequest.getAtrn(), response);
+
+        PhonePeStatusResponseDto phonePeStatusResponseDto = PhonePeStatusResponseDto.builder()
+                .atrn(phonePeInitiationRequest.getAtrn())
+                .paymentStatus(state == null ? "UNKNOWN" : state.name())
+                .phonePeCode(response.getCode())
+                .providerReferenceId(response.getData() == null ? null : response.getData().getProviderReferenceId())
+                .build();
+        logger.info("PhonePe- phonePeStatusResponseDto: {}", phonePeStatusResponseDto);
+
+        return PaymentResponse.builder()
+                .data(List.of(phonePeStatusResponseDto))
+                .status(PaymentConstants.API_RESPONSE_STATUS_SUCCESS)
+                .build();
+    }
+
+    /**
+     * Common for API 2 and API 3: validate, update payment row, save pay modes
+     */
+    private PhonePePaymentState processPaymentResult(String atrn, PhonePeTransactionStatusResponse response) {
+        PhonePePaymentState state = PhonePeUtil.toPaymentState(response.getCode());
+        if (state == null || state == PhonePePaymentState.NOT_FOUND) {
+            logger.info("PhonePe result not applied for Atrn :: {} code :: {} ", atrn, response.getCode());
+            return state;
+        }
+
+        TransactionDto transactionDto = phonePeDao.getTransactionByAtrn(atrn);
+        PhonePeTransactionStatusData data = response.getData();
+
+        if (state == PhonePePaymentState.SUCCESS) {
+            if (data == null || data.getPaidAmount() == null) {
+                throw new PaymentException(ErrorConstants.EXTERNAL_SERVICE_ERROR_CODE,
+                        "PhonePe success response without paid amount");
+            }
+            //validate amount paid with amount in DB
+            phonePeValidator.validateDebitAmount(transactionDto.getDebitAmt(),
+                    PhonePeUtil.paiseToRupees(data.getPaidAmount()).toPlainString());
+            logger.info("Paid amount validated successfully for Atrn :: {} ", atrn);
+        }
+
+        boolean updated = phonePeDao.updatePaymentResult(transactionDto, state, response);
+        if (updated && state == PhonePePaymentState.SUCCESS) {
+            phonePeDao.savePaymentModes(transactionDto, data.getPaymentModes());
+        }
+        return state;
+    }
+
+    private PhonePeTransactionStatusResponse parseWebhook(String rawBody) {
+        try {
+            return objectMapper.readValue(rawBody, PhonePeTransactionStatusResponse.class);
+        } catch (JsonProcessingException e) {
+            logger.error("PhonePe webhook body could not be read");
+            throw new PaymentException(ErrorConstants.INVALID_ERROR_CODE, "Invalid webhook body");
+        }
+    }
+}
