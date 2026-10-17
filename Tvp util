@@ -1,0 +1,94 @@
+
+package com.epay.payment.service;
+
+import com.google.gson.Gson;
+import org.json.JSONObject;
+
+import java.util.HashMap;
+import java.util.Map;
+
+public final class CardTpvUtils {
+
+    private static final Gson GSON = new Gson();
+
+    private CardTpvUtils() {
+        // Utility class
+    }
+
+    /**
+     * Generate request reference number.
+     * Keep your existing SBI ePay reference format here.
+     */
+    public static String generateReqRefNo(
+            String sourceId, String clientId) {
+
+        if (sourceId == null || clientId == null) {
+            throw new IllegalArgumentException(
+                    "sourceId and clientId cannot be null");
+        }
+
+        // Replace with your existing reference-number logic
+        // if SBI ePay requires a specific format.
+        return sourceId + clientId
+                + java.util.UUID.randomUUID()
+                .toString()
+                .replace("-", "")
+                .substring(0, 12);
+    }
+
+    /**
+     * Convert object to JSON.
+     */
+    public static String toJson(Object request) {
+        if (request == null) {
+            throw new IllegalArgumentException(
+                    "Request object cannot be null");
+        }
+
+        return GSON.toJson(request);
+    }
+
+    /**
+     * Build final SBI ePay request parameters.
+     */
+    public static JSONObject createRequest(
+            Map<String, String> reqParamMap) {
+
+        if (reqParamMap == null || reqParamMap.isEmpty()) {
+            throw new IllegalArgumentException(
+                    "Request parameters cannot be empty");
+        }
+
+        return new JSONObject(new HashMap<>(reqParamMap));
+    }
+
+    /**
+     * Validate that encryption produced a result.
+     */
+    public static String validateEncryptedRequest(
+            String encryptedRequest) {
+
+        if (encryptedRequest == null
+                || encryptedRequest.trim().isEmpty()) {
+            throw new IllegalStateException(
+                    "Encrypted request is empty");
+        }
+
+        return encryptedRequest;
+    }
+
+    /**
+     * Validate that signing produced a result.
+     */
+    public static String validateSignedRequest(
+            String signedRequest) {
+
+        if (signedRequest == null
+                || signedRequest.trim().isEmpty()) {
+            throw new IllegalStateException(
+                    "Digital signature is empty");
+        }
+
+        return signedRequest;
+    }
+}
