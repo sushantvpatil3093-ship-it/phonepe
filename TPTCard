@@ -1,0 +1,133 @@
+
+package com.epay.payment.service;
+
+import com.epay.payment.request.eis.tpv.CardTpvAPI;
+import com.epay.payment.request.eis.tpv.CardTpvApiObj;
+import com.google.gson.Gson;
+import org.json.JSONObject;
+import org.springframework.stereotype.Service;
+
+import java.util.HashMap;
+import java.util.Map;
+
+@Service
+public class CardTpvRequestService {
+
+    private final Gson gson = new Gson();
+
+    /**
+     * Creates the SBI ePay Card TPV enquiry request.
+     *
+     * Use your existing CardTpvUtils cryptographic methods.
+     * The keys and formats must match your SBI ePay specification.
+     */
+    public JSONObject createTpvEnquiryRequest(
+            String userId,
+            String clientId,
+            String sourceId,
+            String cardNumber,
+            String aesKey,
+            String eisPublicKeyPath,
+            String epayPrivateKeyPath) {
+
+        if (isBlank(userId)
+                || isBlank(clientId)
+                || isBlank(sourceId)
+                || isBlank(cardNumber)
+                || isBlank(aesKey)
+                || isBlank(eisPublicKeyPath)
+                || isBlank(epayPrivateKeyPath)) {
+            throw new IllegalArgumentException(
+                    "Required Card TPV request parameters are missing");
+        }
+
+        // 1. Generate request reference number.
+        String reqRefNo = CardTpvUtils.generateReqRefNo(
+                sourceId, clientId);
+
+        // 2. Create inner Card TPV request.
+        CardTpvAPI cardTpv = CardTpvAPI.builder()
+                .userId(userId)
+                .bankCode(clientId)
+                .actionType("ENQUIRY")
+                .keyId("C")
+                .keyData(cardNumber)
+                .build();
+
+        // 3. Create outer ePay request payload.
+        CardTpvApiObj requestPayload = CardTpvApiObj.builder()
+                .requestReferenceNumber(reqRefNo)
+                .sourceId(sourceId)
+                .destination("DCMS")
+                .txnType("CARD")
+                .txnSubType("ENQUIRY")
+                .eisPayload(cardTpv)
+                .build();
+
+        // 4. Convert the payload into JSON.
+        String plainReqObj = gson.toJson(requestPayload);
+
+        // 5. Encrypt the AES key using the ePay public key.
+        String accessToken = CardTpvUtils.encryptAesKey(
+                aesKey, eisPublicKeyPath);
+
+        if (isBlank(accessToken)) {
+            throw new IllegalStateException(
+                    "AES key encryption returned an empty result");
+        }
+
+        // 6. Encrypt the request JSON using the AES key.
+        String encRequest = CardTpvUtils.createEncryptedRequest(
+                plainReqObj, aesKey);
+
+        if (isBlank(encRequest)) {
+            throw new IllegalStateException(
+                    "Request encryption returned an empty result");
+        }
+
+        // 7. Digitally sign the original request JSON.
+        String digiSignData = CardTpvUtils.createSignedRequest(
+                plainReqObj, epayPrivateKeyPath);
+
+        if (isBlank(digiSignData)) {
+            throw new IllegalStateException(
+                    "Digital signature generation returned an empty result");
+        }
+
+        // 8. Build the final request parameters.
+        Map<String, String> reqParamMap = new HashMap<>();
+
+        reqParamMap.put(
+                TransactionConstant.REQUEST_REFERENCE_NUMBER,
+                reqRefNo);
+
+        reqParamMap.put(
+                TransactionConstant.API_REQUEST,
+                encRequest);
+
+        reqParamMap.put(
+                TransactionConstant.DIGI_SIGN,
+                digiSignData);
+
+        /*
+         * Add the encrypted AES key here only if the actual SBI ePay
+         * request specification requires it as a separate parameter.
+         * Use the exact parameter name defined by the specification.
+         */
+
+        // 9. Create the final web request.
+        JSONObject webReqObj =
+                CardTpvUtils.createRequest(reqParamMap);
+
+        if (webReqObj == null) {
+            throw new IllegalStateException(
+                    "Failed to create the SBI ePay web request");
+        }
+
+        return webReqObj;
+    }
+
+    private boolean isBlank(String value) {
+        return value == null || value.trim().isEmpty();
+    }
+}
