@@ -1,0 +1,110 @@
+
+package com.epay.payment.service;
+
+import com.google.gson.Gson;
+import org.json.JSONObject;
+
+import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
+import java.security.PrivateKey;
+import java.security.PublicKey;
+import java.util.Map;
+
+public final class CardTpvUtils {
+
+    private static final Gson GSON = new Gson();
+
+    private CardTpvUtils() {
+        // Utility class: prevent instantiation.
+    }
+
+    /**
+     * Generate a unique request reference.
+     * Confirm the required format with the SBI ePay specification.
+     */
+    public static String generateReqRefNo(
+            String sourceId, String clientId) {
+
+        if (isBlank(sourceId) || isBlank(clientId)) {
+            throw new IllegalArgumentException(
+                    "sourceId and clientId are required");
+        }
+
+        return sourceId + clientId
+                + java.util.UUID.randomUUID()
+                    .toString().replace("-", "")
+                    .substring(0, 12);
+    }
+
+    /**
+     * Encrypt the AES key using the ePay public key.
+     * Implement according to the bank's key format and RSA padding.
+     */
+    public static String encryptAesKey(
+            String aesKey, String eisPublicKeyPath) {
+
+        if (isBlank(aesKey) || isBlank(eisPublicKeyPath)) {
+            throw new IllegalArgumentException(
+                    "AES key and public key path are required");
+        }
+
+        PublicKey publicKey =
+                CryptoKeyUtils.loadPublicKey(eisPublicKeyPath);
+
+        return CryptoKeyUtils.encryptAesKey(
+                aesKey, publicKey);
+    }
+
+    /**
+     * Encrypt the original request JSON using the AES key.
+     */
+    public static String createEncryptedRequest(
+            String plainRequest, String aesKey) {
+
+        if (isBlank(plainRequest) || isBlank(aesKey)) {
+            throw new IllegalArgumentException(
+                    "Request JSON and AES key are required");
+        }
+
+        return CryptoKeyUtils.encryptRequest(
+                plainRequest, aesKey);
+    }
+
+    /**
+     * Sign the original request JSON using the ePay private key.
+     */
+    public static String createSignedRequest(
+            String plainRequest, String epayPrivateKeyPath) {
+
+        if (isBlank(plainRequest)
+                || isBlank(epayPrivateKeyPath)) {
+            throw new IllegalArgumentException(
+                    "Request JSON and private key path are required");
+        }
+
+        PrivateKey privateKey =
+                CryptoKeyUtils.loadPrivateKey(epayPrivateKeyPath);
+
+        return CryptoKeyUtils.signRequest(
+                plainRequest, privateKey);
+    }
+
+    /**
+     * Build the outer request object.
+     */
+    public static JSONObject createRequest(
+            Map<String, String> requestParameters) {
+
+        if (requestParameters == null
+                || requestParameters.isEmpty()) {
+            throw new IllegalArgumentException(
+                    "Request parameters are required");
+        }
+
+        return new JSONObject(requestParameters);
+    }
+
+    private static boolean isBlank(String value) {
+        return value == null || value.trim().isEmpty();
+    }
+}
