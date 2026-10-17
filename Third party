@@ -1,0 +1,96 @@
+
+/***** Create request reference number *****/
+String reqRefNo =
+        CardTpvUtils.generateReqRefNo(sourceId, clientId);
+
+/***** Create access token (encrypt AES key using ePay public key) *****/
+String accessToken = TransactionConstant.PATTERN_EMPTY;
+
+try {
+    accessToken = CardTpvUtils.encryptAesKey(
+            aesKey, eisPublicKeyPath);
+} catch (Exception e) {
+    logger.error(
+            "Exception while encrypting AES key for TPV enquiry",
+            e);
+}
+
+/***** Create Card TPV request objects *****/
+CardTpvAPI dcmsTPVEnq = new CardTpvAPI();
+CardTpvApiObj dcmsTPVEnqObj = new CardTpvApiObj();
+
+dcmsTPVEnq.setUserId(sourceId);
+dcmsTPVEnq.setBankCode(clientId);
+dcmsTPVEnq.setActionType("ENQUIRY");
+dcmsTPVEnq.setKeyId("C");
+dcmsTPVEnq.setKeyData(cardNumber);
+
+dcmsTPVEnqObj.setREQUEST_REFERENCE_NUMBER(reqRefNo);
+dcmsTPVEnqObj.setSOURCE_ID(sourceId);
+dcmsTPVEnqObj.setDESTINATION("DCMS");
+dcmsTPVEnqObj.setTXN_TYPE("CARD");
+dcmsTPVEnqObj.setTXN_SUB_TYPE("ENQUIRY");
+dcmsTPVEnqObj.setEIS_PAYLOAD(dcmsTPVEnq);
+
+/***** Convert request to JSON *****/
+Gson plainObj = new Gson();
+String plainReqObj = plainObj.toJson(dcmsTPVEnqObj);
+
+logger.info("Created TPV enquiry request");
+
+/***** Encrypt request using AES key *****/
+String encRequest = TransactionConstant.PATTERN_EMPTY;
+
+try {
+    encRequest = CardTpvUtils.createEncryptedRequest(
+            plainReqObj, aesKey);
+} catch (Exception e) {
+    logger.error(
+            "Exception while encrypting TPV enquiry request",
+            e);
+    throw new IllegalStateException(
+            "Unable to encrypt TPV enquiry request", e);
+}
+
+/***** Sign request using ePay private key *****/
+String digiSignData = TransactionConstant.PATTERN_EMPTY;
+
+try {
+    digiSignData = CardTpvUtils.createSignedRequest(
+            plainReqObj, epayPrivateKeyPath);
+} catch (Exception e) {
+    logger.error(
+            "Exception while digitally signing TPV enquiry request",
+            e);
+    throw new IllegalStateException(
+            "Unable to sign TPV enquiry request", e);
+}
+
+/***** Create request parameter map *****/
+Map<String, String> reqParamMap = new HashMap<>();
+
+reqParamMap.put(
+        TransactionConstant.REQUEST_REFERENCE_NUMBER,
+        reqRefNo);
+
+reqParamMap.put(
+        TransactionConstant.API_REQUEST,
+        encRequest);
+
+reqParamMap.put(
+        TransactionConstant.DIGI_SIGN,
+        digiSignData);
+
+/***** Create web request *****/
+JSONObject webReqObj;
+
+try {
+    webReqObj = CardTpvUtils.createRequest(reqParamMap);
+    logger.info("Created TPV enquiry web request");
+} catch (Exception e) {
+    logger.error(
+            "Exception while creating TPV enquiry web request",
+            e);
+    throw new IllegalStateException(
+            "Unable to create TPV enquiry web request", e);
+}
