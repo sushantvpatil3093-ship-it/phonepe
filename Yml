@@ -1,0 +1,6 @@
+
+# SBI ePay Card TPV configuration
+epay.tpv.source-id=${EPAY_TPV_SOURCE_ID}
+epay.tpv.client-id=${EPAY_TPV_CLIENT_ID}
+epay.tpv.public-key-path=${EPAY_TPV_PUBLIC_KEY_PATH}
+epay.tpv.private-key-path=${EPAY_TPV_PRIVATE_KEY_PATH}
