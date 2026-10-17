@@ -1,0 +1,130 @@
+package com.epay.payment.dto;
+
+import java.util.Arrays;
+import java.util.List;
+
+import com.fasterxml.jackson.annotation.JsonProperty;
+
+public class EisResponse {
+
+    @JsonProperty("ChannelDetails")
+    private final List<ChannelDetails> channelDetails = Arrays.asList(
+        new ChannelDetails("Y", "NA", "DOM", "NA"),
+        new ChannelDetails("N", "NA", "INT", "NA"),
+        new ChannelDetails("Y", "40000", "ATM", "000000000000"),
+        new ChannelDetails("Y", "75000", "POS", "000000000000"),
+        new ChannelDetails("Y", "NA", "ECOM", "NA"),
+        new ChannelDetails("N", "5000", "NFC", "000000000000"),
+        new ChannelDetails("", "QAF", ""),
+        new ChannelDetails("N", "OZF", "")
+    );
+
+    @JsonProperty("ResponseCode")
+    private final String responseCode = "00";
+
+    public List<ChannelDetails> getChannelDetails() {
+        return channelDetails;
+    }
+
+    public String getResponseCode() {
+        return responseCode;
+    }
+}
+
+
+
+package com.epay.payment.dto;
+
+import com.fasterxml.jackson.annotation.JsonProperty;
+
+public class ChannelDetailsResponse {
+
+    @JsonProperty("EIS_RESPONSE")
+    private final EisResponse eisResponse = new EisResponse();
+
+    @JsonProperty("ERROR_CODE")
+    private final String errorCode = "";
+
+    @JsonProperty("ERROR_DESCRIPTION")
+    private final String errorDescription = "";
+
+    @JsonProperty("RESPONSE_STATUS")
+    private final String responseStatus = "0";
+
+    public EisResponse getEisResponse() {
+        return eisResponse;
+    }
+
+    public String getErrorCode() {
+        return errorCode;
+    }
+
+    public String getErrorDescription() {
+        return errorDescription;
+    }
+
+    public String getResponseStatus() {
+        return responseStatus;
+    }
+}
+
+package com.epay.payment.dto;
+
+import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.annotation.JsonProperty;
+
+@JsonInclude(JsonInclude.Include.ALWAYS)
+public class ChannelDetails {
+
+    @JsonProperty("Flag")
+    private String flag;
+
+    @JsonProperty("mLimit")
+    private String mLimit;
+
+    @JsonProperty("cId")
+    private String cId;
+
+    @JsonProperty("eLimit")
+    private String eLimit;
+
+    @JsonProperty("ExpDate")
+    private String expDate;
+
+    public ChannelDetails() {
+    }
+
+    public ChannelDetails(String flag, String mLimit,
+                          String cId, String eLimit) {
+        this.flag = flag;
+        this.mLimit = mLimit;
+        this.cId = cId;
+        this.eLimit = eLimit;
+    }
+
+    public ChannelDetails(String flag, String cId, String expDate) {
+        this.flag = flag;
+        this.cId = cId;
+        this.expDate = expDate;
+    }
+
+    public String getFlag() {
+        return flag;
+    }
+
+    public String getMLimit() {
+        return mLimit;
+    }
+
+    public String getCId() {
+        return cId;
+    }
+
+    public String getELimit() {
+        return eLimit;
+    }
+
+    public String getExpDate() {
+        return expDate;
+    }
+}
