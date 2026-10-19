@@ -1,0 +1,159 @@
+// ===================================================================
+// 1) RESPONSE MODELS  (these give you the highlighted JSON structure)
+//    Put each class in its own file in your model package.
+// ===================================================================
+
+// ---------- CardTPVResponse.java ----------
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import lombok.Data;
+
+@Data
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class CardTPVResponse {
+
+    @JsonProperty("EIS_RESPONSE")
+    private EisResponse eisResponse;
+
+    @JsonProperty("ERROR_CODE")
+    private String errorCode;
+
+    @JsonProperty("ERROR_DESCRIPTION")
+    private String errorDescription;
+
+    @JsonProperty("RESPONSE_STATUS")
+    private String responseStatus;   // "0" = success
+}
+
+// ---------- EisResponse.java ----------
+@Data
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class EisResponse {
+
+    @JsonProperty("ChannelDetails")
+    private java.util.List<ChannelDetail> channelDetails;
+
+    @JsonProperty("ResponseCode")
+    private String responseCode;     // "00" = success
+}
+
+// ---------- ChannelDetail.java ----------
+@Data
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class ChannelDetail {
+
+    @JsonProperty("Flag")
+    private String flag;             // Y / N / blank
+
+    @JsonProperty("mLimit")
+    private String mLimit;
+
+    @JsonProperty("cId")             // DOM, INT, ATM, POS, ECOM, NFC, QAF, OZF
+    private String cId;
+
+    @JsonProperty("eLimit")
+    private String eLimit;
+
+    @JsonProperty("ExpDate")         // only present for some channels (OZF)
+    private String expDate;
+}
+
+// ---------- EisEncryptedEnvelope.java ----------
+// This is what EIS sends BACK (encrypted). Do NOT use CardTPVResponse for it.
+// Change the @JsonProperty/@JsonAlias name to match the real field in your raw response.
+@Data
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class EisEncryptedEnvelope {
+
+    @JsonProperty("ENCRYPTED_RESPONSE")
+    @com.fasterxml.jackson.annotation.JsonAlias({"encryptedResponse", "EncryptedResponse", "ENC_RESPONSE"})
+    private String encryptedResponse;
+}
+
+
+// ===================================================================
+// 2) TPVServicesClient  -- replace your getCardTpvFlag + getEISEComResponse
+// ===================================================================
+
+public CardTPVResponse getCardTpvFlag(String aesKey, String accessToken, String eisRequest) {
+
+    URI uri = URI.create(getBaseUrl() + TPV_API_ENDPOINT);
+    logger.info("Card TPV uri: {}", uri);
+
+    String eisResponseString = getWebClient().post()
+            .uri(uri)
+            .header("Content-Type", MediaType.APPLICATION_JSON_VALUE)
+            .header("Accept", MediaType.APPLICATION_JSON_VALUE)
+            .header("AccessToken", accessToken)          // RSA-encrypted AES key (NOT the file path)
+            .bodyValue(eisRequest)
+            .retrieve()
+            .onStatus(
+                status -> status.is4xxClientError() || status.is5xxServerError(),
+                resp -> resp.bodyToMono(String.class).flatMap(errBody -> {
+                    logger.error("EIS TPV failed. status: {}, body: {}",
+                            resp.statusCode().value(), errBody);
+                    return Mono.error(new TransactionException(
+                            TransactionErrorConstants.EXTERNAL_SERVICE_ERROR_CODE,
+                            MessageFormat.format(
+                                TransactionErrorConstants.EXTERNAL_SERVICE_ERROR_MESSAGE,
+                                "EIS TPV Service")));
+                }))
+            .bodyToMono(String.class)
+            .block();
+
+    logger.info("Card TPV raw response: {}", eisResponseString);
+    return getEISEComResponse(aesKey, eisResponseString);
+}
+
+private CardTPVResponse getEISEComResponse(String aesKey, String eisResponseString) {
+    try {
+        // Step 1: read the encrypted wrapper
+        EisEncryptedEnvelope envelope =
+                objectMapper.readValue(eisResponseString, EisEncryptedEnvelope.class);
+
+        // Step 2: decrypt with the same AES key you used for the request
+        String decrypted = DCMSEISEncryptionDecryptionUtil.decrypt(
+                envelope.getEncryptedResponse(), aesKey);
+        logger.info("Decrypted Card TPV Response: {}", decrypted);
+
+        // Step 3: map to the highlighted structure
+        // {"EIS_RESPONSE":{"ChannelDetails":[...],"ResponseCode":"00"},
+        //  "ERROR_CODE":"","ERROR_DESCRIPTION":"","RESPONSE_STATUS":"0"}
+        return objectMapper.readValue(decrypted, CardTPVResponse.class);
+
+    } catch (JsonProcessingException e) {
+        logger.error("Error creating Card TPV Response: {} response: {}",
+                e.getMessage(), eisResponseString);
+        throw new TransactionException(
+                TransactionErrorConstants.JSON_ERROR_CODE,
+                MessageFormat.format(TransactionErrorConstants.JSON_ERROR_MESSAGE,
+                        eisResponseString));
+    }
+}
+
+
+// ===================================================================
+// 3) CardTpvUtils -- only the LAST line changes
+// ===================================================================
+
+// OLD (bug: you were sending the key FILE PATH as AccessToken)
+// return tpvServicesClient.getCardTpvFlag(aesKey, eisEncKeyPath, payload);
+
+// NEW (send the accessToken you already created with encryptAesKey)
+return tpvServicesClient.getCardTpvFlag(aesKey, accessToken, payload);
+
+
+// ===================================================================
+// 4) HOW TO READ THE RESULT (example)
+// ===================================================================
+
+CardTPVResponse res = cardTpvUtils.getTpvRequestData(cardToken);
+
+if ("0".equals(res.getResponseStatus())
+        && "00".equals(res.getEisResponse().getResponseCode())) {
+
+    for (ChannelDetail ch : res.getEisResponse().getChannelDetails()) {
+        boolean enabled = "Y".equals(ch.getFlag());
+        logger.info("Channel {} enabled={} limit={}", ch.getCId(), enabled, ch.getMLimit());
+    }
+}
