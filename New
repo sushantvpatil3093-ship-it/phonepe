@@ -1,0 +1,123 @@
+ EIS response (AFTER decryption)  -- the highlighted JSON
+//
+// {"EIS_RESPONSE":{"ChannelDetails":[
+//    {"Flag":"Y","mLimit":"NA","cId":"DOM","eLimit":"NA"},
+//    {"Flag":"N","mLimit":"NA","cId":"INT","eLimit":"NA"},
+//    {"Flag":"Y","mLimit":"40000","cId":"ATM","eLimit":"000000000000"},
+//    {"Flag":"Y","mLimit":"75000","cId":"POS","eLimit":"000000000000"},
+//    {"Flag":"Y","mLimit":"NA","cId":"ECOM","eLimit":"NA"},
+//    {"Flag":"N","mLimit":"5000","cId":"NFC","eLimit":"000000000000"},
+//    {"Flag":" ","cId":"QAF"},
+//    {"ExpDate":" ","Flag":"N","cId":"OZF"}],
+//  "ResponseCode":"00"},
+//  "ERROR_CODE":"","ERROR_DESCRIPTION":"","RESPONSE_STATUS":"0"}
+// -------------------------------------------------------------------
+import com.fasterxml.jackson.annotation.JsonAlias;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import lombok.Builder;
+import lombok.Data;
+@Data
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class CardTPVResponse {
+    @JsonProperty("EIS_RESPONSE")
+    private EisResponse eisResponse;
+    @JsonProperty("ERROR_CODE")
+    private String errorCode;
+    @JsonProperty("ERROR_DESCRIPTION")
+    private String errorDescription;
+    @JsonProperty("RESPONSE_STATUS")
+    private String responseStatus;      // "0" = success
+}
+@Data
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class EisResponse {
+
+
+private java.util.List<ChannelDetail> channelDetails;
+    @JsonProperty("ResponseCode")
+    private String responseCode;        // "00" = success
+}
+@Data
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class ChannelDetail {
+    @JsonProperty("Flag")    private String flag;      // Y / N / blank
+    @JsonProperty("mLimit")  private String mLimit;
+    @JsonProperty("cId")     private String cId;       // DOM, INT, ATM, POS, ECOM, 
+NFC, QAF, OZF
+    @JsonProperty("eLimit")  private String eLimit;
+    @JsonProperty("ExpDate") private String expDate;   // only for some channels
+}
+// -------------------------------------------------------------------
+// 2) EIS raw response (BEFORE decryption) -- encrypted wrapper
+//    Match the field name with your real raw response.
+// -------------------------------------------------------------------
+@Data
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class EisEncryptedEnvelope {
+    @JsonProperty("ENCRYPTED_RESPONSE")
+    @JsonAlias({"encryptedResponse", "EncryptedResponse", "ENC_RESPONSE"})
+    private String encryptedResponse;
+}
+// -------------------------------------------------------------------
+// 3) Decrypt + parse (in TPVServicesClient)
+// -------------------------------------------------------------------
+private CardTPVResponse getEISEComResponse(String aesKey, String eisResponseString) {
+    try {
+        EisEncryptedEnvelope envelope =
+                objectMapper.readValue(eisResponseString, 
+EisEncryptedEnvelope.class);
+        String decrypted = DCMSEISEncryptionDecryptionUtil.decrypt(
+                envelope.getEncryptedResponse(), aesKey);
+        return objectMapper.readValue(decrypted, CardTPVResponse.class);
+    } catch (JsonProcessingException e) {
+        logger.error("Error creating Card TPV Response: 
+
+
+
+
+
+ e.getMessage(), eisResponseString);
+        throw new TransactionException(
+                TransactionErrorConstants.JSON_ERROR_CODE,
+                MessageFormat.format(TransactionErrorConstants.JSON_ERROR_MESSAGE,
+                        eisResponseString));
+    }
+}
+// -------------------------------------------------------------------
+// 4) ePay API response (what YOUR controller returns)
+//
+// {
+//   "status": "SUCCESS",
+//   "errorCode": "",
+//   "errorMessage": "",
+//   "channels": [
+//     {"channel":"DOM","enabled":true,"maxLimit":"NA"},
+//     {"channel":"INT","enabled":false,"maxLimit":"NA"},
+//     {"channel":"ATM","enabled":true,"maxLimit":"40000"},
+//     {"channel":"POS","enabled":true,"maxLimit":"75000"},
+//     {"channel":"ECOM","enabled":true,"maxLimit":"NA"},
+//     {"channel":"NFC","enabled":false,"maxLimit":"5000"}
+//   ]
+// }
+// -------------------------------------------------------------------
+@Data
+@Builder
+public class SbiTpvResponse {
+    private String status;          // SUCCESS / FAILED
+    private String errorCode;
+    private String errorMessage;
+    private java.util.List<ChannelInfo> channels;
+    @Data
+    @Builder
+    public static class ChannelInfo {
+        private String channel;
+        private boolean enabled;
+        private String maxLimit;
+    }
+}
+// -------------------------------------------------------------------
+// 5) Service: EIS response  ->  ePay response
+// -------------------------------------------------------------------
+public interface SbiTpvService {
+    SbiTpvResponse verify(SbiTpvRequest request);
