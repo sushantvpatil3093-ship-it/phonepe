@@ -1,0 +1,55 @@
+   /**
+     * This method is being used to validate TPV of card number from eis-service
+     *
+     * @param request EncryptedRequest String of card number
+     * @return TransactionResponse with tpvCardNumberResponse
+     */
+    public TransactionResponse<EncryptedResponse> verifyCardTPV(EncryptedRequest request) {
+
+        //Step 1 : validate encrypt request
+        eisValidator.validateCardNumberRequest(request.getEncryptedRequest());
+
+        //Step 2 : Get Merchant MEK
+        logger.info("Card TPV encrypt request received");
+        String aesKeyTxn = sbiEisDao.getEncryptedAESKey();          // never log this key
+
+        //Step 3 : Decrypt request
+        // keep the remaining arguments exactly as in your ecom method
+        CardVerificationRequest cardVerificationRequest =
+                TransactionUtil.buildRequestByEncryptRequest(request.getEncryptedRequest(), aesKeyTxn /* , ...same as ecom */);
+
+        //Step 4 : validate request
+        eisValidator.validateCardNumber(cardVerificationRequest.getCardNumber());
+
+        //Step 5 : call EIS TPV (utility -> client -> decrypted CardTPVResponse)
+        CardTPVResponse tpvResponse = cardTpvUtils.getTpvRequestData(cardVerificationRequest.getCardNumber());
+        logger.debug("Card TPV response code: {}", tpvResponse == null ? null : tpvResponse.getResponseCode());
+
+        //Step 6 : fail if EIS did not return success
+        if (tpvResponse == null || !EIS_SUCCESS_CODE.equals(tpvResponse.getResponseCode())) {
+            logger.error("Card TPV failed, response code: {}",
+                    tpvResponse == null ? null : tpvResponse.getResponseCode());
+            throw new TransactionException(
+                    TransactionErrorConstants.EXTERNAL_SERVICE_ERROR_CODE,
+                    MessageFormat.format(TransactionErrorConstants.EXTERNAL_SERVICE_ERROR_MESSAGE, "EIS TPV Service"));
+        }
+
+        EisTpvFinalResponse eisTpvFinalResponse = EisTpvFinalResponse.builder()
+                .tpvFlag(tpvResponse.getTpvFlag())
+                .responseCode(tpvResponse.getResponseCode())
+                .responseMessage(tpvResponse.getResponseMessage())
+                .build();
+
+        //Step 7 : encrypt response
+        EncryptedResponse response = EncryptedResponse.builder()
+                .encryptedResponse(EncryptionDecryptionUtil.encryptValue(
+                        aesKeyTxn, TransactionUtil.convertToJson(eisTpvFinalResponse)))
+                .status(TransactionConstant.RESPONSE_SUCCESS)
+                .build();
+
+        return TransactionResponse.<EncryptedResponse>builder()
+                .data(Collections.singletonList(response))
+                /* .status(...) etc. - same as your ecom return */
+                .build();
+    }
+}
