@@ -1,0 +1,94 @@
+private final LoggerUtility logger = LoggerFactoryUtility.getLogger(this.getClass());
+
+    private final SbiEisDao sbiEisDao;            // your existing DAO (now also has getDCMSEISTpvInfo)
+    private final EisValidator eisValidator;
+    private final CardTpvUtils cardTpvUtils;      // @Component
+
+    /**
+     * This method is being used to validate TPV of card number from eis-service
+     *
+     * @param request EncryptedRequest String of card number
+     * @return TransactionResponse with tpvCardNumberResponse
+     */
+    public TransactionResponse<EncryptedResponse> verifyCardTPV(EncryptedRequest request) throws Exception {
+
+        //Step 1 : validate encrypt request
+        eisValidator.validateCardNumberRequest(request.getEncryptedRequest());
+
+        //Step 2 : Get Merchant MEK
+        logger.info("Card TPV encrypt request received");
+        String aesKeyTxn = sbiEisDao.getEncryptedAESKey();
+
+        //Step 3 : Decrypt request (keep remaining arguments exactly as in your ecom method)
+        CardVerificationRequest cardVerificationRequest =
+                TransactionUtil.buildRequestByEncryptRequest(request.getEncryptedRequest(), aesKeyTxn /* , ...same as ecom */);
+
+        //Step 4 : validate request
+        eisValidator.validateCardNumber(cardVerificationRequest.getCardNumber());
+
+        //Step 5 : build TPV request and call EIS through the DAO
+        String aesKey = TransactionUtil.generateRandomKey();
+        String eisTpvRequest = cardTpvUtils.buildTpvRequest(cardVerificationRequest.getCardNumber(), aesKey);
+        String eisEncryptionKey = cardTpvUtils.generateTpvAccessToken(aesKey);
+
+        TransactionResponse<CardTPVResponse> tpvDetail =
+                sbiEisDao.getDCMSEISTpvInfo(aesKey, eisEncryptionKey, eisTpvRequest);
+        logger.debug("Fetch TPV card response status: {}", tpvDetail.getStatus());
+
+        //Step 6 : final response
+        CardTPVResponse tpv = tpvDetail.getData().getFirst();
+        EisTpvFinalResponse eisTpvFinalResponse = EisTpvFinalResponse.builder()
+                .tpvFlag(tpv.getTpvFlag())
+                .responseCode(tpv.getResponseCode())
+                .responseMessage(tpv.getResponseMessage())
+                .build();
+
+        //Step 7 : encrypt response
+        EncryptedResponse response = EncryptedResponse.builder()
+                .encryptedResponse(EncryptionDecryptionUtil.encryptValue(
+                        aesKeyTxn, TransactionUtil.convertToJson(eisTpvFinalResponse)))
+                .status(TransactionConstant.RESPONSE_SUCCESS)
+                .build();
+
+        return TransactionResponse.<EncryptedResponse>builder()
+                .data(Collections.singletonList(response))
+                /* .status(...) etc. - same as your ecom return */
+                .build();
+    }
+}
+
+
+
+// =====================================================================
+// 1) Your existing DAO class (the one with getDCMSEISEComInfo / verifyGSTInNumber)
+//    add a TPVServicesClient field and this method - same shape as getDCMSEISEComInfo
+// =====================================================================
+
+private final TPVServicesClient tpvServicesClient;     // add next to eisServicesClient
+
+/**
+ * Calls EIS TPV and returns the decrypted TPV response.
+ * Same pattern as getDCMSEISEComInfo: empty errorCode = success, otherwise throw.
+ */
+public TransactionResponse<CardTPVResponse> getDCMSEISTpvInfo(String aesKey, String eisEncryptionKey, String eisTpvRequest) {
+    CardTPVResponse eisResponse = tpvServicesClient.getCardTpvFlag(aesKey, eisEncryptionKey, eisTpvRequest);
+    logger.info("EISTpvResponse code: {}", eisResponse.getErrorCode());   // don't log the full response
+
+    if (StringUtils.isEmpty(eisResponse.getErrorCode())) {
+        return TransactionResponse.<CardTPVResponse>builder()
+                .data(List.of(eisResponse))
+                .status(TransactionConstant.RESPONSE_SUCCESS)
+                /* same extra builder fields as your ecom return, if any */
+                .build();
+    }
+    throw new TransactionException(eisResponse.getErrorCode(), eisResponse.getErrorDescription());
+}
+
+
+// =====================================================================
+// 2) CardTPVResponse -> add the two error fields (names copied from your EISResponse;
+//    change the JSON names to the EIS spec)
+// =====================================================================
+
+@JsonProperty("errorCode")
+private String errorCode;
