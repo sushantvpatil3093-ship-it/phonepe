@@ -1,0 +1,321 @@
+package com.epay.transaction.externalservice.response.eis.tpv;
+
+import com.epay.transaction.util.TransactionUtil;
+import org.junit.jupiter.api.Test;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+class CardTPVResponseTest {
+
+    @Test
+    void parsesSbiResponse() throws Exception {
+        String json = "{\"EIS_RESPONSE\":{\"ChannelDetails\":[{\"Flag\":\"Y\",\"mLimit\":\"NA\",\"cld\":\"DOM\",\"eLimit\":\"NA\"},"
+            + "{\"Flag\":\"Y\",\"mLimit\":\"75000\",\"cld\":\"POS\",\"eLimit\":\"000000000000\"},"
+            + "{\"Flag\":\" \",\"cld\":\"QAF\"}],\"ResponseCode\":\"00\"},"
+            + "\"ERROR_CODE\":\"\",\"ERROR_DESCRIPTION\":\"\",\"RESPONSE_STATUS\":\"0\"}";
+
+        CardTPVResponse r = TransactionUtil.objectMapper.readValue(json, CardTPVResponse.class);
+
+        assertEquals("00", r.getEisResponse().getResponseCode());
+        assertEquals(3, r.getEisResponse().getChannelDetails().size());
+        assertEquals("POS", r.getEisResponse().getChannelDetails().get(1).getCId());
+        assertEquals("75000", r.getEisResponse().getChannelDetails().get(1).getMLimit());
+    }
+}
+
+
+
+
+
+
+@Component
+@RequiredArgsConstructor
+public class CardTpvUtils {
+
+    private static final LoggerUtility logger =
+        LoggerFactoryUtility.getLogger(CardTpvUtils.class);
+    private static final SecureRandom RND = new SecureRandom();
+    private static final String ALL_CHARS =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+    private final TPVServicesClient tpvServicesClient;
+
+    @Value("${sbi.tpv.source-id}") private String sourceId;   // DK
+    @Value("${sbi.tpv.client-id}") private String clientId;   // SBI
+
+    public CardTPVResponse getTpvRequestData(String cardNumber) {
+        String aesKey = generateRandomKey();
+        String reqRefNo = generateReqRefNo(sourceId, clientId);
+
+        // 1. Access token = AES key encrypted with EIS public cert
+        String accessToken = encryptAesKey(aesKey, SBI_EIS_INC_TPV);
+
+        // 2. Plain request: only the 3 fields SBI expects
+        CardTpvApiObj api = CardTpvApiObj.builder()
+                .requestReferenceNumber(reqRefNo)
+                .sourceId(sourceId)
+                .accountNumber(cardNumber)   // real number, padded if SBI needs it
+                .build();
+        String plainReq = toJson(api);       // Jackson, not Gson
+
+        // 3. Encrypt + sign
+        String encRequest = createEncryptedRequest(plainReq, aesKey);
+        String digiSign = createSignedRequest(plainReq, SBI_PRIVATE_KEY);
+
+        // 4. Wrapper payload
+        Map<String, String> map = new HashMap<>();
+        map.put(TransactionConstant.REQUEST_REFERENCE_NUMBER, reqRefNo);
+        map.put(TransactionConstant.API_REQUEST, encRequest);
+        map.put(TransactionConstant.DIGI_SIGN, digiSign);
+        String payload = createRequest(map).toString();
+
+        logger.info("TPV request sent, ref {}, card {}",
+                reqRefNo, maskAccountNumber(cardNumber));
+
+        // 5. Pass accessToken (NOT the file path)
+        return tpvServicesClient.getCardTpvFlag(aesKey, accessToken, payload);
+    }
+
+    private static String toJson(Object o) {
+        try { return TransactionUtil.objectMapper.writeValueAsString(o); }
+        catch (JsonProcessingException e) {
+            throw new TransactionException(TransactionErrorConstants.JSON_ERROR_CODE, "Request build failed");
+        }
+    }
+
+    public static String generateRandomKey() {
+        StringBuilder sb = new StringBuilder(32);
+        for (int i = 0; i < 32; i++) sb.append(ALL_CHARS.charAt(RND.nextInt(ALL_CHARS.length())));
+        return sb.toString();
+    }
+
+
+
+
+public static String encryptAesKey(String aesKey, String certResource) {
+    try (InputStream in = new ClassPathResource(certResource).getInputStream()) {
+        PublicKey pub = ((X509Certificate) CertificateFactory.getInstance("X.509")
+                .generateCertificate(in)).getPublicKey();
+        Cipher c = Cipher.getInstance("RSA/ECB/OAEPPadding");
+        c.init(Cipher.ENCRYPT_MODE, pub);
+        return Base64.getEncoder().encodeToString(c.doFinal(aesKey.getBytes(StandardCharsets.UTF_8)));
+    } catch (Exception e) {
+        logger.error("AES key encryption failed", e);
+        throw new TransactionException(TransactionErrorConstants.EXTERNAL_SERVICE_ERROR_CODE, "Encryption failed");
+    }
+}
+
+public static String createSignedRequest(String data, String keyResource) {
+    try (InputStream in = new ClassPathResource(keyResource).getInputStream()) {
+        String pem = new String(in.readAllBytes(), StandardCharsets.UTF_8)
+                .replaceAll("-----BEGIN [A-Z ]*-----", "")
+                .replaceAll("-----END [A-Z ]*-----", "")
+                .replaceAll("\\s", "");
+        PrivateKey pk = KeyFactory.getInstance("RSA")
+                .generatePrivate(new PKCS8EncodedKeySpec(Base64.getDecoder().decode(pem)));
+        Signature s = Signature.getInstance("SHA256withRSA");
+        s.initSign(pk);
+        s.update(data.getBytes(StandardCharsets.UTF_8));
+        return Base64.getEncoder().encodeToString(s.sign());
+    } catch (Exception e) {
+        logger.error("Signing failed", e);
+        throw new TransactionException(TransactionErrorConstants.EXTERNAL_SERVICE_ERROR_CODE, "Signing failed");
+    }
+}
+
+
+
+
+
+
+@PostMapping("/card/sbi/tpv")
+@Operation(summary = "Card TPV Verification")
+@PreAuthorize("hasAnyRole('TRANSACTION')")
+public TransactionResponse<EncryptedResponse> verifyCardTpv(
+        @Valid @RequestBody EncryptedRequest encryptedRequest) {
+    logger.info("Card TPV request received");   // never log the body
+    return cardTpvService.verifyCardTPV(encryptedRequest);
+}
+
+
+
+
+
+private EisApiHistoryDto buildEisTpvHistory(CardVerificationRequest req,
+                                            String status, String errorCode) {
+    EisApiHistoryDto dto = new EisApiHistoryDto();
+    // Field names are guesses. Match them to your DTO.
+    dto.setApiName("CARD_TPV");
+    dto.setRequest(CardTpvUtils.maskAccountNumber(req.getCardNumber()));
+    dto.setResponse(status + (errorCode == null ? "" : ":" + errorCode));
+    dto.setCreatedDate(LocalDateTime.now());
+    return dto;
+}
+
+
+
+
+
+
+@Test
+void encryptDecryptRoundTrip() {
+    String key = CardTpvUtils.generateRandomKey();
+    String enc = CardTpvUtils.createEncryptedRequest("{\"a\":\"b\"}", key);
+    assertEquals("{\"a\":\"b\"}", DCMSEISEncryptionDecryptionUtil.decrypt(enc, key));
+}
+
+
+
+
+
+
+@Configuration
+public class TpvClientConfig {
+
+    @Bean
+    public TPVServicesClient tpvServicesClient(
+            @Value("${external.api.services.base-url.eis}") String baseUrl,   // use your real property name
+            ObjectMapper objectMapper,
+            @Value("${cors.origin:*}") String corsOrigin) {
+        return new TPVServicesClient(baseUrl, objectMapper, corsOrigin);
+    }
+}
+
+
+
+
+
+@Service
+@RequiredArgsConstructor
+public class CardTpvService {
+
+    private static final LoggerUtility logger =
+            LoggerFactoryUtility.getLogger(CardTpvService.class);
+
+    private final SbiEisDao sbiEisDao;
+    private final CardTpvUtils cardTpvUtils;
+
+    @Value("${card.tpv.dummy.enabled:false}")
+    private boolean dummyEnabled;
+
+    public TransactionResponse<EncryptedResponse> verifyCardTPV(EncryptedRequest request) {
+
+        // Step 1: UI AES key (never log it)
+        String aesKeyTxn = sbiEisDao.getEncryptedAESKey();
+
+        // Step 2: decrypt the UI request
+        CardVerificationRequest cardReq = TransactionUtil.buildRequestByEncryptRequest(
+                request.getEncryptedRequest(), aesKeyTxn, CardVerificationRequest.class);
+
+        // Step 3: validate
+        validateRequest(cardReq);
+        logger.info("Card TPV started for card {}",
+                CardTpvUtils.maskAccountNumber(cardReq.getCardNumber()));
+
+        // Step 4: dummy or real SBI call, with history saved either way
+        String status = "FAILED";
+        String errorCode = null;
+        EisTpvFinalResponse finalResp;
+        try {
+            if (dummyEnabled) {
+                finalResp = buildDummyResponse();
+            } else {
+                CardTPVResponse sbiResp =
+                        cardTpvUtils.getTpvRequestData(cardReq.getCardNumber());
+                validateSbiResponse(sbiResp);
+                finalResp = buildFinalResponse(sbiResp);
+            }
+            status = "SUCCESS";
+        } catch (TransactionException e) {
+            errorCode = e.getErrorCode();
+            throw e;
+        } finally {
+            saveHistory(cardReq, status, errorCode);
+        }
+
+        // Step 5: encrypt with the UI key and return
+        EncryptedResponse response = EncryptedResponse.builder()
+                .encryptedResponse(EncryptionDecryptionUtil.encryptValue(
+                        aesKeyTxn, TransactionUtil.toJson(finalResp)))
+                .build();
+
+        logger.info("Card TPV completed");
+        return TransactionResponse.<EncryptedResponse>builder()
+                .data(Collections.singletonList(response))
+                .status(TransactionConstant.RESPONSE_SUCCESS)
+                .build();
+    }
+
+    // ---------- validation ----------
+
+    private void validateRequest(CardVerificationRequest req) {
+        if (req == null || req.getCardNumber() == null || req.getCardNumber().isBlank()) {
+            throw new TransactionException(
+                    TransactionErrorConstants.INVALID_REQUEST_CODE, "Card number is required");
+        }
+    }
+
+    private void validateSbiResponse(CardTPVResponse r) {
+        boolean bad = r == null
+                || !"0".equals(r.getResponseStatus())
+                || (r.getErrorCode() != null && !r.getErrorCode().isBlank())
+                || r.getEisResponse() == null
+                || !"00".equals(r.getEisResponse().getResponseCode())
+                || r.getEisResponse().getChannelDetails() == null
+                || r.getEisResponse().getChannelDetails().isEmpty();
+        if (bad) {
+            logger.error("SBI TPV failed, code {}", r == null ? "NO_RESPONSE" : r.getErrorCode());
+            throw new TransactionException(
+                    TransactionErrorConstants.EXTERNAL_SERVICE_ERROR_CODE,
+                    "Card verification failed. Please try again.");
+        }
+    }
+
+    // ---------- response building ----------
+
+    private EisTpvFinalResponse buildFinalResponse(CardTPVResponse r) {
+        Map<String, String> flags = new HashMap<>();
+        for (CardChannelDetails c : r.getEisResponse().getChannelDetails()) {
+            if (c.getCId() != null) {
+                flags.put(c.getCId().trim().toUpperCase(), cleanFlag(c.getFlag()));
+            }
+        }
+        return EisTpvFinalResponse.builder()
+                .domFlag(flags.get("DOM"))
+                .intFlag(flags.get("INT"))
+                .posFlag(flags.get("POS"))
+                .atmFlag(flags.get("ATM"))
+                .nfcFlag(flags.get("NFC"))
+                .ecomFlag(flags.get("ECOM"))
+                .build();
+    }
+
+    // Blank flag (like the QAF row) means "unknown", not "N"
+    private String cleanFlag(String f) {
+        return (f == null || f.isBlank()) ? null : f.trim().toUpperCase();
+    }
+
+    private EisTpvFinalResponse buildDummyResponse() {
+        return EisTpvFinalResponse.builder()
+                .domFlag("Y").intFlag("N").posFlag("Y")
+                .atmFlag("Y").nfcFlag("N").ecomFlag("Y")
+                .build();
+    }
+
+    // ---------- history ----------
+
+    private void saveHistory(CardVerificationRequest req, String status, String errorCode) {
+        try {
+            EisApiHistoryDto dto = new EisApiHistoryDto();
+            // Match these setter names to your DTO
+            dto.setApiName("CARD_TPV");
+            dto.setRequest(CardTpvUtils.maskAccountNumber(req.getCardNumber()));
+            dto.setResponse(status + (errorCode == null ? "" : ":" + errorCode));
+            dto.setCreatedDate(LocalDateTime.now());
+            sbiEisDao.saveEisHistory(dto);
+        } catch (Exception e) {
+            // History failure must never break the card check
+            logger.error("Could not save TPV history", e);
+        }
+    }
+}
