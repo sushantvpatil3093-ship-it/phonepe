@@ -1,0 +1,449 @@
+API Endpoint
+API Request
+Http Method	API
+POST	https://api.phonepe.com/apis/hermes/v4/debit
+Headers
+Headers
+
+{
+  "Content-Type": "application/json",
+  "X-VERIFY": "<sha256_hash>###<salt_index>",
+  "X-CALLBACK-URL": "<your_callback_url>"
+}
+Request
+Raw Payload (before base64 encoding):
+
+{
+        "merchantId": "MERCHANT_ID",
+        "subMerchantId": "SUB_MERCHANT_ID",
+        "transactionId": "transaction_id",
+        "amount": 100,
+        "mcc": 7349, 
+        "merchantUserId": "merchantUserId",
+        "mobileNumber": "9912345678",
+        "message": "message",
+        "email": "abc@gmail.com",
+        "paymentScope": "PHONEPE",
+        "deviceContext": {
+            "deviceOS": "IOS",
+            "isPPAppPresent": true,
+            "supportedUriSchemas": ["ppe"],
+            "appSupportedSchemas": ["ppemerchantsdkv3"],
+        }
+}
+Request Body
+
+{
+  "request": "<base64_encoded_payload>"
+}
+Response
+Response
+
+{
+  "success": true,
+  "code": "SUCCESS",
+  "message": "Your request has been successfully completed.",
+  "data": {
+    "redirectType": "INTENT",
+    "redirectURL": "ppe://pay?pa=MID@axl&pn=Infinity+Store&am=2.00&mam=2.00&tr=TEST_Tid71375846599349273294&tn=Payment+for+OD139924923&mc=7349&mode=04&purpose=00&utm_campaign=DEBIT&utm_medium=MID&utm_source=TEST_Tid71375846599349273294"
+  }
+}
+
+
+
+
+
+
+
+
+
+
+package com.epay.payment.dao;
+
+import com.epay.payment.dto.*;
+import com.epay.payment.exceptions.PaymentException;
+import com.epay.payment.repository.UpiFinalResponseRepository;
+import com.epay.payment.util.ErrorConstants;
+import com.epay.payment.util.PaymentConstants;
+import com.epay.payment.util.enums.PaymentStatus;
+import com.sbi.epay.logging.utility.LoggerFactoryUtility;
+import com.sbi.epay.logging.utility.LoggerUtility;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Component;
+
+import java.math.BigDecimal;
+import java.sql.Timestamp;
+import java.text.MessageFormat;
+
+@Component
+@RequiredArgsConstructor
+public class UpiPaymentDao {
+
+    private final PaymentOrderSummeryDao paymentOrderSummeryDao;
+    private final TransactionDao transactionDao;
+    private final PaymentDao paymentDao;
+    private final OrderDao orderDao;
+    private final StatusUpdatePaymentDao statusUpdatePaymentDao;
+    private final UpiFinalResponseRepository finalResponseRepository;
+
+    LoggerUtility logger = LoggerFactoryUtility.getLogger(this.getClass());
+
+
+    public void processUpiResponse(UpiProcessResponseDto upiProcessResponseDto) {
+
+        logger.info("processUpiStausQueryResponse()- upiProcessStatusDto  ::  {} ", upiProcessResponseDto);
+
+        UpiMapDbResponseDto upiMapDbResponseDto = UpiMapDbResponseDto.builder().sbirefNo(upiProcessResponseDto.getSbirefNo())
+                .status(upiProcessResponseDto.getStatus())
+                .payProc(upiProcessResponseDto.getPayProc())
+                .amount(upiProcessResponseDto.getAmount())
+                .status_desc(upiProcessResponseDto.getStatus_desc())
+                .txnrefNo(upiProcessResponseDto.getTxnrefNo())
+                .payMode(upiProcessResponseDto.getPayMode())
+                .splitAmt(upiProcessResponseDto.getSplitAmt()).updatedBy(upiProcessResponseDto.getUpdatedBy()).build();
+        UpiMapDbResponseDto upiMapDbResponse = updateGtwMApId(upiMapDbResponseDto);
+        logger.info("Upi Status Query Response upiMapDbResponse : "+ upiMapDbResponse);
+        switch (upiMapDbResponseDto.getStatus()) {
+
+            case PaymentConstants.UPI_STATUS_SUCCESS_CONST, PaymentConstants.UPI_STATUS_T_CONST -> {
+                statusUpdatePaymentDao.paymentUPISuccessPendingStatusUpdateGen(PaymentStatus.SUCCESS.toString(), upiMapDbResponse , upiProcessResponseDto.getUpdatedBy() ,PaymentConstants.UPI_KEY);
+            }
+            case PaymentConstants.UPI_STATUS_F_CONST, PaymentConstants.UPI_STATUS_R_CONST,
+                 PaymentConstants.UPI_STATUS_X_CONST, PaymentConstants.UPI_STATUS_Z_CONST -> {
+                paymentDao.updateUpiFailPendingTransactionStatusGen(PaymentStatus.FAILED.toString(), PaymentStatus.FAILED.toString(),upiMapDbResponse, upiProcessResponseDto.getUpdatedBy(), new Timestamp(System.currentTimeMillis()).getTime());
+            }
+            default -> {
+                logger.info("Default Case: processUpiResponse()- upi response db update  ::  {} ", upiProcessResponseDto.getStatus());
+            }
+        }
+    }
+
+    public void processUpiResponseVpa(UpiProcessResponseDto upiProcessResponseDto) {
+
+        logger.info("Process Upi Status Query Response for VPA- upiProcessStatusDto  ::  {} ", upiProcessResponseDto);
+        UpiMapDbResponseDto upiMapDbResponseDto = UpiMapDbResponseDto.builder().sbirefNo(upiProcessResponseDto.getSbirefNo())
+                .status(upiProcessResponseDto.getStatus())
+                .status_desc(upiProcessResponseDto.getStatus_desc())
+                .txnrefNo(upiProcessResponseDto.getTxnrefNo()).build();
+
+        switch (upiMapDbResponseDto.getStatus()) {
+            case PaymentConstants.UPI_STATUS_SUCCESS_CONST, PaymentConstants.UPI_STATUS_T_CONST -> {
+                statusUpdatePaymentDao.paymentSuccessPendingStatusUpdateGen(PaymentStatus.SUCCESS.toString(), upiMapDbResponseDto.getTxnrefNo(), upiMapDbResponseDto.getSbirefNo(), upiProcessResponseDto.getUpdatedBy(), PaymentConstants.UPI_KEY);
+            }
+            case PaymentConstants.UPI_STATUS_F_CONST, PaymentConstants.UPI_STATUS_R_CONST,
+                 PaymentConstants.UPI_STATUS_X_CONST, PaymentConstants.UPI_STATUS_Z_CONST -> {
+                paymentDao.updateFailPendingTransactionStatusGen(PaymentStatus.FAILED.toString(), PaymentStatus.FAILED.toString(), upiMapDbResponseDto.getSbirefNo(), upiMapDbResponseDto.getStatus_desc(), upiMapDbResponseDto.getTxnrefNo(), upiProcessResponseDto.getUpdatedBy(), new Timestamp(System.currentTimeMillis()).getTime());
+            }
+            default -> {
+                logger.info("Default Case: processUpiResponse()- upi response db update  ::  {} ", upiProcessResponseDto.getStatus());
+            }
+        }
+    }
+
+
+
+    private UpiMapDbResponseDto updateGtwMApId(UpiMapDbResponseDto upiMapDbResponseDto) {
+        switch(upiMapDbResponseDto.getPayProc()){
+            case PaymentConstants.PAYPROC_BHIMQR_CLNIB ->{
+                upiMapDbResponseDto.setPayProc("BHIMQR CLNIB");
+                upiMapDbResponseDto.setGtwMapId("288");
+            }case PaymentConstants.PAYPROC_BHIMQR_CLIB -> {
+                upiMapDbResponseDto.setPayProc("BHIMQR CLIB");
+                upiMapDbResponseDto.setGtwMapId("281");
+            }case PaymentConstants.PAYPROC_BHIMQR_CC -> {
+                upiMapDbResponseDto.setPayProc("BHIMQR CC");
+                upiMapDbResponseDto.setGtwMapId("281");
+            }case PaymentConstants.PAYPROC_BHIMQR_PPI -> {
+                upiMapDbResponseDto.setPayProc("BHIMQR PPI");
+                upiMapDbResponseDto.setGtwMapId("283");
+            }case PaymentConstants.PAYPROC_BHIMQR -> {
+                upiMapDbResponseDto.setPayProc("BHIMQR");
+                upiMapDbResponseDto.setGtwMapId("182");
+            }default -> {
+                logger.info("Upi Status Query Response PayProc is empty");
+                throw new PaymentException(ErrorConstants.INVALID_ERROR_CODE, MessageFormat
+                        .format(ErrorConstants.INVALID_ERROR_MESSAGE, "PayProc", "PayProc is empty or invalid"));
+            }
+        }
+        return upiMapDbResponseDto;
+    }
+
+    public void saveFinalResponse(String atrnNum, String upiTransId, String npciTransId, String custRefNo, BigDecimal amount, String status, String payproc, String splitAmount,
+                                  String statusDescription, String responseCode, String packet, String payerVa, String payeeVa, long createdDate, String createdBy) {
+        finalResponseRepository.insertFinalResponse(atrnNum, upiTransId, npciTransId, custRefNo, amount, status,payproc, splitAmount, statusDescription, responseCode, packet, payerVa, payeeVa, createdDate, createdBy);
+    }
+
+    public String getPayProc(String payprocType){
+        String payProc = null;
+        if ("CREDIT LINE".equals(payprocType) || "CREDITLINE01".equals(payprocType) || "CREDITLINE02".equals(payprocType) || "CREDITLINE03".equals(payprocType) ||
+                "CREDITLINE04".equals(payprocType) || "CREDITLINE05".equals(payprocType) || "CREDITLINE06".equals(payprocType) ||
+                "CREDITLINE07".equals(payprocType) || "CREDITLINE08".equals(payprocType) || "CREDITLINE09".equals(payprocType) || "CREDITLINE10".equals(payprocType)) {
+            payProc = PaymentConstants.PAYPROC_BHIMQR_CLNIB;
+        } else if ("CL01".equals(payprocType) || "CL02".equals(payprocType) || "CL03".equals(payprocType) || "CL04".equals(payprocType) ||
+                "CL05".equals(payprocType) || "CL06".equals(payprocType) || "CL07".equals(payprocType) ||
+                "CL08".equals(payprocType) || "CL09".equals(payprocType) || "CL10".equals(payprocType) || "CL011".equals(payprocType) || "CL012".equals(payprocType) ||
+                "CL013".equals(payprocType) || "CL014".equals(payprocType) || "CL015".equals(payprocType) || "SOD".equals(payprocType)) {
+            payProc = PaymentConstants.PAYPROC_BHIMQR_CLIB;
+        } else if ("CREDIT".equals(payprocType)) {
+            payProc = PaymentConstants.PAYPROC_BHIMQR_CC;
+        } else if ("PPIWALLET".equals(payprocType) || "BANKWALLET".equals(payprocType) || "Voucher".equals(payprocType)) {
+            payProc = PaymentConstants.PAYPROC_BHIMQR_PPI;
+        }
+     else {
+        payProc = PaymentConstants.PAYPROC_BHIMQR;
+         }
+        return payProc;
+    }
+
+}
+
+
+
+
+
+
+
+
+
+
+
+  public PaymentResponse<?>  getCardAuthenticationStatus(PaymentRequestCard paymentRequestCard) {
+        PaymentInitiationRequest paymentInitiationRequest=getInitiationCardsRequest(paymentRequestCard);
+        validateCardRequest.validateCardRequest(paymentInitiationRequest);
+        PayProcIdVisaMasterCard.getPayProdId(paymentInitiationRequest.getPayProcId());
+        TransactionDto transactionDto = transactionDao.getValidPaymentAckReq(paymentRequestCard.getAtrn(), PaymentStatus.BOOKED.toString());
+        logger.info("transactionDto {} for reference no {} ",transactionDto, transactionDto.getAtrnNum());
+        CardOnBoardDetailsResponseDto cardOnboardDto=getConfigDetails(transactionDto.getMerchantId(),paymentRequestCard.getOperatingMode());
+        logger.info("Merchant Onboard Details Fetched cardOnBoardDetailsResponseDto {} for reference no {} ",cardOnboardDto,transactionDto.getAtrnNum());
+
+        PVrqResponse pVrqResponse = processPvrqVersioning(transactionDto, paymentRequestCard);
+        switch (pVrqResponse.getErrorCode()) {
+            case PaymentConstants.SUCCESS_CODE -> {
+                PArqResponse pArqResponse = processParqAuthentication(transactionDto, cardOnboardDto, paymentRequestCard, pVrqResponse);
+                switch (pArqResponse.getTransStatus()) {
+                    case PaymentConstants.CHALLANGE_C -> {
+                        PaymentFinalResponse paymentFinalResponse = getRedirectObject(transactionDto, String.valueOf(TransactionStatus.BOOKED), String.valueOf(TransactionStatus.BOOKED));
+
+                        CardVisaResponseDto cardVisaResponseDto = getCardInitiationResponse(paymentFinalResponse,transactionDto,PaymentConstants.PENDING_CONST,transactionDto.getAtrnNum(),pArqResponse.getAcsChallengeReqUrl(),pArqResponse.getCReq());
+                        logger.info("pArq Response received cardVisaResponseDto {} for reference no {} ", cardVisaResponseDto, transactionDto.getAtrnNum());
+                        return PaymentResponse.<CardVisaResponseDto>builder().data(List.of(cardVisaResponseDto)).status(PaymentConstants.API_RESPONSE_STATUS_SUCCESS).build();
+                    }
+                    case PaymentConstants.CHALLANGE_A, PaymentConstants.YES -> {
+                        SaleAPIResponse saleAPIResponse = processSaleRequest(cardOnboardDto, transactionDto, paymentRequestCard, pArqResponse);
+                        if (saleAPIResponse.getStatus().equalsIgnoreCase(PaymentConstants.PG_SUCCESS) && saleAPIResponse.getPgErrorCode().equalsIgnoreCase(PaymentConstants.ZERO)) {
+                            PaymentFinalResponse paymentFinalResponse = getRedirectObject(transactionDto,PaymentConstants.SUCCESS_DESC, PaymentConstants.SUCCESS_DESC);
+
+                            return PaymentResponse.<CardVisaFrictionlessResponseDto>builder().data(List.of(CardVisaFrictionlessResponseDto.builder().cardPaymentStatus(paymentFinalResponse.getTransactionStatus().equals(PaymentConstants.SUCCESS_DESC) ? PaymentConstants.SUCCESS_DESC : PaymentConstants.FAILED).atrn(transactionDto.getAtrnNum()).availableAuthMode(PaymentConstants.VISA_Frictionless)
+                                    .encryptedPaymentFinalResponse(paymentCallbackForwardService.processInitiationResponse(paymentFinalResponse,transactionDto,orderDao.getOrderDetails(transactionDto))).orderRetryCount(paymentFinalResponse.getOrderRetryCount()).atrnNumber(paymentFinalResponse.getAtrn()).transactionStatus(paymentFinalResponse.getTransactionStatus()).reason(paymentFinalResponse.getReason()).sbiOrderRefNumber(paymentFinalResponse.getSbiOrderId()).orderRefNumber(paymentFinalResponse.getMerchantOrderNumber()).totalAmount(paymentFinalResponse.getTotalAmount())
+                                    .returnUrl(orderDao.getOrderDetails(transactionDto).getReturnUrl()).currencyCode(transactionDto.getCurrencyCode()).mId(transactionDto.getMerchantId()).build())).status(PaymentConstants.API_RESPONSE_STATUS_SUCCESS).build();
+
+                        } else {
+                            PaymentFinalResponse paymentFinalResponse = getRedirectObject(transactionDto, String.valueOf(TransactionStatus.FAILED), String.valueOf(TransactionStatus.FAILED));
+                            CardVisaResponseDto cardVisaResponseDto = getCardInitiationResponse(paymentFinalResponse,transactionDto,PaymentConstants.FAILURE_CONST,transactionDto.getAtrnNum(),PaymentConstants.initiateURL,PaymentConstants.dummyHash);
+                            logger.info("Sale Response received failed for cardVisaResponseDto {} for reference no {} ", cardVisaResponseDto, transactionDto.getAtrnNum());
+                            return PaymentResponse.<CardVisaResponseDto>builder().data(List.of(cardVisaResponseDto)).status(PaymentConstants.API_RESPONSE_STATUS_FAIL).errors(List.of(getResponseDto(saleAPIResponse.getPgErrorCode(),saleAPIResponse.getPgErrorDetail(),transactionDto.getAtrnNum(),saleAPIResponse.getTransactionId()))).build();
+                        }
+                    }
+                    default -> {
+                        PaymentFinalResponse paymentFinalResponse = getRedirectObject(transactionDto, String.valueOf(TransactionStatus.FAILED), String.valueOf(TransactionStatus.FAILED));
+                        CardVisaResponseDto cardVisaResponseDto = getCardInitiationResponse(paymentFinalResponse,transactionDto,PaymentConstants.FAILURE_CONST,transactionDto.getAtrnNum(),PaymentConstants.initiateURL,PaymentConstants.dummyHash);
+                        logger.info("pArq Response received failed for cardVisaResponseDto {} for reference no {} ", cardVisaResponseDto, transactionDto.getAtrnNum());
+                        return PaymentResponse.<CardVisaResponseDto>builder().data(List.of(cardVisaResponseDto)).status(PaymentConstants.API_RESPONSE_STATUS_FAIL).errors(List.of(getResponseDto(pArqResponse.getErrorCode(),pArqResponse.getErrorDescription(),transactionDto.getAtrnNum(),pArqResponse.getThreeDSServerTransID()))).build();
+                    }
+                }
+            }
+            default -> {
+                PaymentFinalResponse paymentFinalResponse = getRedirectObject(transactionDto, String.valueOf(TransactionStatus.FAILED), String.valueOf(TransactionStatus.FAILED));
+                CardVisaResponseDto cardVisaResponseDto = getCardInitiationResponse(paymentFinalResponse,transactionDto,PaymentConstants.FAILURE_CONST,transactionDto.getAtrnNum(),PaymentConstants.initiateURL,PaymentConstants.dummyHash);
+                logger.info("pVrq Response received failed for cardVisaResponseDto {} for reference no {} ", cardVisaResponseDto, transactionDto.getAtrnNum());
+                return PaymentResponse.<CardVisaResponseDto>builder().data(List.of(cardVisaResponseDto)).status(PaymentConstants.API_RESPONSE_STATUS_FAIL).errors(List.of(getResponseDto(pVrqResponse.getErrorCode(),PaymentConstants.FAILED,transactionDto.getAtrnNum(),pVrqResponse.getThreeDSServerTransID()))).build();
+            }
+        }
+    }
+
+    /**
+     * @return: SaleAPIResponse
+     * @methodName: processSaleRequest
+     * @@Method-Description: Process sale request
+     * @param: cardOnboardDto,  transactionDto,  paymentRequestCard,  altIDResponse,  pArqResponse
+     * @Exception: or @Error :Exception
+     */
+
+    public SaleAPIResponse processSaleRequest(CardOnBoardDetailsResponseDto cardOnboardDto, TransactionDto transactionDto, PaymentRequestCard paymentRequestCard, PArqResponse pArqResponse)  {
+        SaleAPIResponse saleAPIResponse;
+        String saleRequestPayload = cardINTLUtil.createSaleSeamRequestPayload(cardOnboardDto,transactionDto , paymentRequestCard, pArqResponse);
+        paymentDao.saveRequestLog(cardINTLUtil.createSaleSeamRequestPayloadLogCapture(cardOnboardDto,transactionDto , paymentRequestCard, pArqResponse),transactionDto.getAtrnNum(),PaymentConstants.SALE_REQ,PaymentConstants.CREATED_BY_WIBMOPG);
+        logger.info("Sale API Request {} for reference no {} ",cardINTLUtil.createSaleSeamRequestPayloadLogCapture(cardOnboardDto,transactionDto , paymentRequestCard, pArqResponse),transactionDto.getAtrnNum(),transactionDto.getAtrnNum());
+        String encryptedSaleRequest = cardINTLUtil.getEncryptedPayload(saleRequestPayload);
+        HashMap<String, String> cardRequestHeaders = cardINTLUtil.createThreeDsRequestHeader(cardConfigDeatils.getApi_key(),cardConfigDeatils.getPgInstanceId());
+        String apiResponse = cardWebClientService.initiateCardWebClient(cardConfigDeatils.getSaleAuthURL(), encryptedSaleRequest, String.class, cardRequestHeaders);
+        logger.info("Sale API Response {} for reference no {} ",apiResponse,transactionDto.getAtrnNum());
+        String decryptedRequestPayload= cardINTLUtil.getDecryptedPayload(apiResponse);
+        saleAPIResponse= new Gson().fromJson(decryptedRequestPayload, SaleAPIResponse.class);
+        paymentDao.saveResponseLog(decryptedRequestPayload,transactionDto.getAtrnNum(),saleAPIResponse.getTransactionId(),PaymentConstants.SALE_RESP,PaymentConstants.CREATED_BY_WIBMOPG);
+        cardPaymentDao.processSaleApiResponse(saleAPIResponse,transactionDto);
+        return Optional.of(saleAPIResponse).orElseThrow(() -> new PaymentException(CardErrorConstants.PROCESS_SERVICE_ERROR_CODE, MessageFormat.format(CardErrorConstants.PROCESS_SERVICE_ERROR_MESSAGE,PaymentConstants.SALE)));
+    }
+
+    /**
+     * @return: PVrqResponse
+     * @methodName: processPvrqVersioning
+     * @@Method-Description: Process pVrq request
+     * @param: transactionDto,  paymentRequestCard,  tokenAltResponse
+     * @Exception: or @Error :Exception
+     */
+
+    public PVrqResponse processPvrqVersioning(TransactionDto transactionDto, PaymentRequestCard paymentRequestCard) {
+        String pvrqVersioningRequestPayload = cardINTLUtil.createPvrqVersioningPayload(paymentRequestCard);
+        logger.info("pVrq Request {} for reference no {} ",cardINTLUtil.createPvrqVersioningPayloadLogCapture(paymentRequestCard),transactionDto.getAtrnNum());
+        paymentDao.saveRequestLog(cardINTLUtil.createPvrqVersioningPayloadLogCapture(paymentRequestCard),transactionDto.getAtrnNum(),PaymentConstants.PVRQ_REQ,PaymentConstants.CREATED_BY_WIBMOPG);
+        String signedEncRequestPayload = cardINTLUtil.getEncryptedpvrqPayload(pvrqVersioningRequestPayload);
+        HashMap<String, String> cardRequestHeaders = cardINTLUtil.createThreeDsRequestHeader(cardConfigDeatils.getApi_key(),cardConfigDeatils.getAcquirerID());
+        String pVrqApiResponse = cardWebClientService.initiateCardWebClient(cardConfigDeatils.getPvReqURL()+paymentRequestCard.getAtrn(), signedEncRequestPayload, String.class, cardRequestHeaders);
+        logger.info("pVrq Response {} for reference no {} ",pVrqApiResponse,transactionDto.getAtrnNum());
+        String decryptedRequestPayload= cardINTLUtil.getDecryptedPayload(pVrqApiResponse);
+        paymentDao.saveResponseLog(decryptedRequestPayload,transactionDto.getAtrnNum(),transactionDto.getAtrnNum(),PaymentConstants.PVRQ_RESP,PaymentConstants.CREATED_BY_WIBMOPG);
+        return Optional.ofNullable(new Gson().fromJson(decryptedRequestPayload, PVrqResponse.class)).orElseThrow(() -> new PaymentException(CardErrorConstants.PROCESS_SERVICE_ERROR_CODE, MessageFormat.format(CardErrorConstants.PROCESS_SERVICE_ERROR_MESSAGE,PaymentConstants.messageType_PVRQ)));
+    }
+
+    /**
+     * @return: PArqResponse
+     * @methodName: processParqAuthentication
+     * @@Method-Description: Process pArq request
+     * @param: transactionDto, cardOnboardDto,  paymentRequestCard,  altIDResponse,  pArqResponse
+     * @Exception: or @Error :Exception
+     */
+
+    public PArqResponse processParqAuthentication(TransactionDto transactionDto,CardOnBoardDetailsResponseDto cardOnboardDto, PaymentRequestCard paymentRequestCard,PVrqResponse pVrqResponse)  {
+        String createParqRequestPayload = cardINTLUtil.createParqPayload(transactionDto, cardOnboardDto, paymentRequestCard, pVrqResponse);
+        logger.info("pArq Request {} for reference no {} ",cardINTLUtil.createParqPayloadLogCapture(transactionDto, cardOnboardDto, paymentRequestCard, pVrqResponse), transactionDto.getAtrnNum());
+        paymentDao.saveRequestLog(cardINTLUtil.createParqPayloadLogCapture(transactionDto, cardOnboardDto, paymentRequestCard, pVrqResponse), transactionDto.getAtrnNum(), PaymentConstants.PARQ_REQ, PaymentConstants.CREATED_BY_WIBMOPG);
+        String signedEncRequestPayload = cardINTLUtil.getEncryptedpvrqPayload(createParqRequestPayload);
+        HashMap<String, String> cardRequestHeaders = cardINTLUtil.createThreeDsRequestHeader(cardConfigDeatils.getApi_key(), cardConfigDeatils.getPgInstanceId_1());
+        String pArqApiResponse = cardWebClientService.initiateCardWebClient(pVrqResponse.getThreeDSServerPaRqURL(), signedEncRequestPayload, String.class, cardRequestHeaders);
+        logger.info("pArq Response {} for reference no {} ",pArqApiResponse,transactionDto.getAtrnNum());
+        String decryptedRequestPayload = cardINTLUtil.getDecryptedPayload(pArqApiResponse);
+        paymentDao.saveResponseLog(decryptedRequestPayload, transactionDto.getAtrnNum(), pVrqResponse.getThreeDSServerTransID(),PaymentConstants.PARQ_RESP, PaymentConstants.CREATED_BY_WIBMOPG);
+        cardPaymentDao.saveCardSummery(transactionDto.getAtrnNum(), cardINTLUtil.maskAltId(paymentRequestCard.getAltNumber(),6,4),transactionDto.getMerchantId(), String.valueOf(transactionDto.getDebitAmt()), pVrqResponse.getThreeDSServerTransID(),
+                cardINTLUtil.saveSummaryData(cardINTLUtil.getAltIdToken(paymentRequestCard),pVrqResponse, new Gson().fromJson(decryptedRequestPayload, PArqResponse.class)), cardINTLUtil.hashValue(paymentRequestCard.getAltNumber()));
+        return Optional.ofNullable(new Gson().fromJson(decryptedRequestPayload, PArqResponse.class)).orElseThrow(() -> new PaymentException(CardErrorConstants.PROCESS_SERVICE_ERROR_CODE, MessageFormat.format(CardErrorConstants.PROCESS_SERVICE_ERROR_MESSAGE,PaymentConstants.messageType_PVRQ)));
+    }
+
+    public CardOnBoardDetailsResponseDto getConfigDetails(String merchantId,String operatingMode) {
+        ResponseDto<CardOnBoardDetailsResponseDto> cardConfigDetails = cardAdminConfigDetailsClientService.getCardConfigDetails(merchantId,operatingMode);
+        return Optional.of(cardPaymentMapper.mapToCardOnBoardDetailsResponseDto(cardConfigDetails.getData().getFirst())).orElseThrow(() -> new PaymentException(CardErrorConstants.PROCESS_SERVICE_ERROR_CODE, MessageFormat.format(CardErrorConstants.PROCESS_SERVICE_ERROR_MESSAGE,PaymentConstants.Card_Onboard)));
+    }
+
+    /**
+     * @return: ErrorDto
+     * @methodName: getResponseDto
+     * @@Method-Description: Process getting card response Error Codes
+     * @param: paymentRequestCard
+     * @Exception: or @Error :Exception
+     */
+    public ErrorDto  getResponseDto(String errorCode,String errorMessage,String atrn,String bankReferenceNumber){
+        statusUpdatePaymentDao.paymentFailureStatusUpdate(atrn, bankReferenceNumber == null ? PaymentConstants.ZERO : bankReferenceNumber,errorCode == null ? PaymentConstants.NA : errorCode.concat(PaymentConstants.PIPE).concat(errorMessage), PaymentConstants.CREATED_BY_WIBMOPG);
+        return ErrorDto.builder().errorCode(ErrorConstants.CARD_INITIATION_ERROR_CODE).errorMessage(ErrorConstants.CARD_INITIATION_ERROR_MESSAGE).build();
+    }
+
+    public PaymentInitiationRequest getInitiationCardsRequest(PaymentRequestCard paymentRequestCard){
+        return Optional.of(PaymentInitiationRequest.builder()
+                .atrn(paymentRequestCard.getAtrn())
+                .paymode(paymentRequestCard.getPaymode())
+                .operatingMode(paymentRequestCard.getOperatingMode())
+                .payProcId(paymentRequestCard.getPayProcId())
+                .payProcType(paymentRequestCard.getPayProcType())
+                .altNumber(paymentRequestCard.getAltNumber())
+                .expiryMonth(paymentRequestCard.getExpiryMonth())
+                .expiryYear(paymentRequestCard.getExpiryYear())
+                .cvv(paymentRequestCard.getCvv())
+                .cardHolderName(paymentRequestCard.getCardHolderName())
+                .build()).orElseThrow(() -> new PaymentException(CardErrorConstants.PROCESS_SERVICE_ERROR_CODE, MessageFormat.format(CardErrorConstants.PROCESS_SERVICE_ERROR_MESSAGE,PaymentConstants.Authentication)));
+    }
+
+    /**
+     * @return: CardVisaResponseDto
+     * @methodName: getCardInitiationResponse
+     * @@Method-Description: Process setting response data
+     * @param: TransactionDto,Status
+     * @Exception: or @Error :Exception
+     */
+    public CardVisaResponseDto getCardInitiationResponse(PaymentFinalResponse paymentFinalResponse,TransactionDto transactionDto,String cardPaymentStatus,String atrn,String postUrl,String cReq) {
+        return CardVisaResponseDto.builder()
+                .cardPaymentStatus(cardPaymentStatus)
+                .atrn(atrn)
+                .availableAuthMode(PaymentConstants.VISA_Redirection)
+                .postURL(postUrl)
+                .creq(cReq)
+                .encryptedPaymentFinalResponse(paymentCallbackForwardService.processInitiationResponse(paymentFinalResponse,transactionDto,orderDao.getOrderDetails(transactionDto)))
+                .orderRetryCount(orderDao.getOrderDetails(transactionDao.getTransactionDetails(atrn)).getOrderRetryCount())
+                .atrnNumber(paymentFinalResponse.getAtrn())
+                .transactionStatus(paymentFinalResponse.getTransactionStatus())
+                .reason(paymentFinalResponse.getReason())
+                .sbiOrderRefNumber(paymentFinalResponse.getSbiOrderId())
+                .orderRefNumber(paymentFinalResponse.getMerchantOrderNumber())
+                .totalAmount(paymentFinalResponse.getTotalAmount())
+                .returnUrl(orderDao.getOrderDetails(transactionDto).getReturnUrl())
+                .currencyCode(transactionDto.getCurrencyCode())
+                .mId(transactionDto.getMerchantId())
+                .build();
+    }
+    /**
+     * @return: PaymentFinalResponse
+     * @methodName: getRedirectObject
+     * @@Method-Description: Process setting response data
+     * @param: TransactionDto,Status
+     * @Exception: or @Error :Exception
+     */
+    public PaymentFinalResponse getRedirectObject(TransactionDto transactionDto, String status,String responseReason) {
+        Order order = orderDao.getOrderDetails(transactionDto);
+        FinalResponseStatus finalResponseStatus=getStatus(transactionDto,order,status,responseReason);
+        return PaymentFinalResponse.builder()
+                .mId(transactionDto.getMerchantId())
+                .merchantOrderNumber(transactionDto.getOrderRefNumber())
+                .sbiOrderId(transactionDto.getSbiOrderRefNumber())
+                .orderAmount(String.valueOf(transactionDto.getOrderAmount()))
+                .totalAmount(String.valueOf(transactionDto.getDebitAmt()))
+                .atrn(transactionDto.getAtrnNum())
+                .transactionStatus(finalResponseStatus.getStatus())
+                .reason(finalResponseStatus.getResponseReason())
+                .CIN(transactionDto.getCin())
+                .otherDetails(order.getOtherDetails())
+                .bankName(transactionDto.getChannelBank())
+                .bankTxnNumber(transactionDto.getBankReferenceNumber())
+                .bankCode(transactionDto.getPayMode())
+                .customerId(order.getCustomerId())
+                .orderRetryCount(String.valueOf(order.getOrderRetryCount()))
+                .build();
+    }
+
+    /**
+     * @return: FinalResponseStatus
+     * @methodName: getStatus
+     * @@Method-Description: Process setting response status
+     * @param: transactionDto,order,channelStatus,failureReason
+     * @Exception: or @Error :Exception
+     */
+    public FinalResponseStatus getStatus(TransactionDto transactionDto, Order order, String channelStatus, String failureReason){
+        if(!transactionDto.getOrderAmount().equals(order.getOrderAmount())){
+            return FinalResponseStatus.builder().status(PaymentConstants.FAILED).responseReason(PaymentConstants.FAILED_FOR_AMOUNT_NOT_MATCHED).build();
+        }else{
+            return FinalResponseStatus.builder().status(channelStatus).responseReason(failureReason.replaceAll(PaymentConstants.SPECIAL_CHAR_REGEX,PaymentConstants.EMPTY)).build();
+        }
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
