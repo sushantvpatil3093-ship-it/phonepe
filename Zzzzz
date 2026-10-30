@@ -1,0 +1,98 @@
+// Validate amount
+paymentValidator.validateDebitAmount(transactionDto.getDebitAmt());
+
+// Validate currency
+phonePeValidator.validateCurrencyCode(transactionDto.getCurrencyCode());
+
+// Initiate PhonePe payment
+PhonePeDebitResponse phonePeDebitResponse =
+        processDebitRequest(transactionDto);
+
+// Validate PhonePe response
+if (phonePeDebitResponse == null
+        || !phonePeDebitResponse.isSuccess()
+        || phonePeDebitResponse.getData() == null
+        || phonePeDebitResponse.getData().getRedirectURL() == null) {
+
+    throw new PaymentException(
+            ErrorConstants.EXTERNAL_SERVICE_ERROR_CODE,
+            "PhonePe payment initiation failed"
+    );
+}
+
+// Map PhonePe response
+PostingData postingData = new PostingData();
+
+// Map these fields according to your actual PostingData class
+postingData.setRedirectUrl(
+        phonePeDebitResponse.getData().getRedirectURL()
+);
+
+// Return response
+return PaymentResponse.<PostingData>builder()
+        .status(PaymentConstants.API_RESPONSE_STATUS_SUCCESS)
+        .data(List.of(postingData))
+        .build();
+
+
+
+
+
+
+
+
+private PhonePeDebitResponse processDebitRequest(
+        TransactionDto transactionDto) {
+
+    // 1. Build PhonePe debit request
+    PhonePeDebitRequest debitRequest = PhonePeDebitRequest.builder()
+            .merchantId(properties.getMerchantId())
+            .transactionId(transactionDto.getAtrnNum())
+            .amount(PhonePeUtil.rupeesToPaise(
+                    transactionDto.getDebitAmt()))
+            .paymentScope("PHONEPE")
+            .build();
+
+    // 2. Convert request object into JSON
+    String rawPayload = toJson(debitRequest);
+
+    // 3. Convert JSON into Base64
+    String base64Payload = PhonePeUtil.toBase64(rawPayload);
+
+    // 4. Create outer request wrapper
+    PhonePeData phonePeRequest = PhonePeData.builder()
+            .request(base64Payload)
+            .build();
+
+    String requestPayload = toJson(phonePeRequest);
+
+    // 5. Generate X-VERIFY checksum
+    String checksum = PhonePeUtil.debitChecksum(
+            base64Payload,
+            properties.getDebitChecksumPath(),
+            properties.getSaltKey(),
+            properties.getSaltIndex()
+    );
+
+    // 6. Prepare headers
+    Map<String, String> requestHeaders = new HashMap<>();
+
+    requestHeaders.put("X-VERIFY", checksum);
+    requestHeaders.put(
+            "X-CALLBACK-URL",
+            properties.getCallbackUrl()
+    );
+
+    // 7. Call PhonePe API
+    PhonePeDebitResponse response =
+            phonePeWebClientService.initiatePhonePeClient(
+                    HttpMethod.POST,
+                    properties.getBaseUrl()
+                            + properties.getDebitPath(),
+                    requestPayload,
+                    PhonePeDebitResponse.class,
+                    requestHeaders
+            );
+
+    return response;
+}
