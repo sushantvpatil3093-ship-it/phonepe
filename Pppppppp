@@ -1,0 +1,69 @@
+public PaymentResponse<PostingData> generatePhonePeReqPayload(
+        PaymentRequest paymentWebRequest) {
+
+    // 1. Create initiation request
+    PaymentInitiationRequest paymentInitiationRequest =
+            getInitiationRequest(paymentWebRequest);
+
+    // 2. Validate PhonePe request
+    phonePeValidator.validatePhonePeRequest(paymentInitiationRequest);
+
+    logger.info("PhonePe payment request validated for ATRN: {}",
+            paymentWebRequest.getAtrn());
+
+    // 3. Get transaction details
+    TransactionDto transactionDto =
+            transactionDao.getValidPaymentAckReq(
+                    paymentWebRequest.getAtrn(),
+                    PaymentStatus.BOOKED.toString()
+            );
+
+    logger.info("PhonePe transaction details: {}", transactionDto);
+
+    // 4. Validate amount
+    paymentValidator.validateDebitAmount(transactionDto.getDebitAmt());
+
+    logger.info("PhonePe amount validated successfully");
+
+    // 5. Create original PhonePe JSON payload
+    String plainTextWebReqData = paymentUtil.debitChecksum(
+            paymentWebRequest.getAtrn(),
+            transactionDto.getDebitAmt()
+    );
+
+    logger.info("PhonePe raw payload created for ATRN: {}",
+            paymentWebRequest.getAtrn());
+
+    // 6. Save original request
+    paymentDao.saveRequestLog(
+            plainTextWebReqData,
+            paymentWebRequest.getAtrn(),
+            PaymentConstants.WEB_REQUEST_TYPE,
+            PaymentConstants.CREATED_BY_WALLET
+    );
+
+    // 7. Convert JSON payload into Base64
+    String base64Payload = phonePeUtil.toBase64(plainTextWebReqData);
+
+    // 8. Generate X-VERIFY checksum
+    String checksum = phonePeUtil.debitChecksum(
+            base64Payload,
+            "/v4/debit",
+            properties.getSaltKey(),
+            properties.getSaltIndex()
+    );
+
+    // 9. Create PhonePe outer request
+    PhonePeData phonePeRequest = PhonePeData.builder()
+            .request(base64Payload)
+            .build();
+
+    logger.info("PhonePe Base64 request and checksum generated for ATRN: {}",
+            paymentWebRequest.getAtrn());
+
+    // 10. Return request data
+    // Pass phonePeRequest and checksum to your outbound HTTP client.
+    return PaymentResponse.<PostingData>builder()
+            .status(PaymentConstants.API_RESPONSE_STATUS_SUCCESS)
+            .build();
+}
