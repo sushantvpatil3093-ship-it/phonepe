@@ -1,0 +1,54 @@
+public <T> T initiatePhonePeWebClient(
+        HttpMethod httpMethod,
+        String url,
+        String requestPayload,
+        Class<T> responseDto) {
+
+    WebClient.RequestBodySpec requestSpec =
+            webClient.method(httpMethod).uri(url);
+
+    WebClient.ResponseSpec responseSpec;
+
+    if (requestPayload == null || requestPayload.isBlank()) {
+        responseSpec = requestSpec.retrieve();
+    } else {
+        responseSpec = requestSpec
+                .bodyValue(requestPayload)
+                .retrieve();
+    }
+
+    T response = responseSpec
+            .onStatus(
+                    status -> status.isError(),
+                    this::handleError
+            )
+            .bodyToMono(responseDto)
+            .block();
+
+    logger.info("PhonePe call completed, method: {}", httpMethod);
+
+    return response;
+}
+
+
+
+
+
+
+private Mono<? extends Throwable> handleError(
+        ClientResponse response) {
+
+    int status = response.statusCode().value();
+
+    logger.error("PhonePe returned HTTP status: {}", status);
+
+    return response.bodyToMono(String.class)
+            .defaultIfEmpty("Empty error response")
+            .flatMap(errorBody ->
+                    Mono.error(new PaymentException(
+                            ErrorConstants.EXTERNAL_SERVICE_ERROR_CODE,
+                            "PhonePe returned HTTP " + status
+                                    + ": " + errorBody
+                    ))
+            );
+}
