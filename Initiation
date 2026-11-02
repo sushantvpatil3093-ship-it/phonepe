@@ -1,0 +1,86 @@
+@PostMapping("/initiate")
+public ResponseEntity<PaymentResponse<PhonePeInitiationPayloadDto>> initiate(@Valid @RequestBody PhonePeInitiationRequest request) {
+    return ResponseEntity.ok(phonePeService.generatePhonePeReqPayload(request));
+}
+
+
+
+
+/**
+ * @return -JSON : PaymentResponse<PhonePeInitiationPayloadDto> (1.postUrl, 2.request, 3.checksum, 4.callbackUrl)
+ * @methodName: generatePhonePeReqPayload
+ * @Method-Description: The purpose of this method is to create the PhonePe V4 debit request
+ * (base64) and its X-VERIFY checksum from the ATRN. PhonePe is NOT called here.
+ * @param: phonePeInitiationRequest
+ * @Exception or @Error :Exception
+ */
+@Transactional
+public PaymentResponse<PhonePeInitiationPayloadDto> generatePhonePeReqPayload(PhonePeInitiationRequest phonePeInitiationRequest) {
+    phonePeValidator.validatePhonePeAuthRequest(getInitiationRequest(phonePeInitiationRequest));
+    logger.info("Payment Initiation Request validated successfully for Atrn {} ", phonePeInitiationRequest.getAtrn());
+
+    TransactionDto transactionDto = phonePeDao.getTransactionForInitiation(phonePeInitiationRequest.getAtrn());
+    logger.info("Payment Initiation get atrn details {} ", transactionDto);
+
+    paymentValidator.validateDebitAmount(transactionDto.getDebitAmt());
+    phonePeValidator.validateCurrencyCode(transactionDto.getCurrencyCode());
+    logger.info("Amount validated successfully");
+
+    String plainTextRequest = toJson(createDebitRequest(transactionDto));
+    logger.info("Payment Initiation Plain Text Web Request {} and ATRN {}", plainTextRequest, transactionDto.getAtrnNum());
+    paymentDao.saveRequestLog(plainTextRequest, transactionDto.getAtrnNum(),
+            PaymentConstants.WEB_REQUEST_TYPE, PaymentConstants.CREATED_BY_WALLET);
+
+    String base64Payload = PhonePeUtil.toBase64(plainTextRequest);
+    PhonePeInitiationPayloadDto payloadDto = PhonePeInitiationPayloadDto.builder()
+            .atrn(transactionDto.getAtrnNum())
+            .postUrl(properties.getBaseUrl() + properties.getDebitPath())
+            .request(base64Payload)
+            .checksum(PhonePeUtil.debitChecksum(base64Payload, properties.getDebitChecksumPath(),
+                    properties.getSaltKey(), properties.getSaltIndex()))
+            .callbackUrl(properties.getCallbackUrl())
+            .build();
+    logger.info("Payment Initiation PhonePe request created for ATRN {}", transactionDto.getAtrnNum());
+
+    return PaymentResponse.<PhonePeInitiationPayloadDto>builder()
+            .status(PaymentConstants.API_RESPONSE_STATUS_SUCCESS)
+            .data(List.of(payloadDto))
+            .build();
+}
+
+
+
+https://api-preprod.phonepe.com/apis/pg-sandbox
+
+
+
+@Data @AllArgsConstructor @NoArgsConstructor @Builder
+public class PhonePeInitiationPayloadDto {
+    @SerializedName("atrn") @JsonProperty("atrn") private String atrn;
+    @SerializedName("postUrl") @JsonProperty("postUrl") private String postUrl;             // PhonePe /v4/debit URL
+    @SerializedName("request") @JsonProperty("request") private String request;             // base64 payload
+    @SerializedName("checksum") @JsonProperty("checksum") private String checksum;          // send as X-VERIFY header
+    @SerializedName("callbackUrl") @JsonProperty("callbackUrl") private String callbackUrl; // send as X-CALLBACK-URL header
+}
+
+
+phonepe:
+  merchant-id: ${PHONEPE_MERCHANT_ID}        # UAT merchant ID
+  salt-key: ${PHONEPE_SALT_KEY}              # UAT salt key
+  salt-index: ${PHONEPE_SALT_INDEX}
+  base-url: <UAT debit base URL from PhonePe>
+  status-base-url: https://api-preprod.phonepe.com/apis/pg-sandbox
+  callback-url: https://<uat-host>/api/v1/phonepe/webhook
+  webhook-confirm-with-status: true
+
+
+
+phonepe:
+  merchant-id: ${PHONEPE_MERCHANT_ID}        # production merchant ID
+  salt-key: ${PHONEPE_SALT_KEY}
+  salt-index: ${PHONEPE_SALT_INDEX}
+  base-url: https://api.phonepe.com
+  status-base-url: https://api.phonepe.com/apis/pg
+  callback-url: https://<prod-host>/api/v1/phonepe/webhook
+  webhook-confirm-with-status: true
+
