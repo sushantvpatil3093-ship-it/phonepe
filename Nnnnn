@@ -1,0 +1,102 @@
+private final PaymentDao paymentDao;
+private final ObjectMapper objectMapper;
+
+/**
+ * @param request holds only the atrn
+ * @return PaymentResponse<PhonePeData>
+ * @methodName initiatePayment
+ * @Method-Description Reads amount from DB, calls PhonePe debit, returns redirect data
+ * @Exception PaymentException
+ */
+@Transactional
+public PaymentResponse<PhonePeData> initiatePayment(PaymentInitiationRequest request) {
+    logger.info("PhonePe initiation started for ATRN {}", request.getAtrn());
+    phonePeValidator.validatePhonePeRequest(request);
+
+    TransactionDto transactionDto = transactionDao.getValidPaymentAckReq(
+            request.getAtrn(), PaymentStatus.BOOKED.toString(), PaymentConstants.PHONEPE_CONST);
+
+    PhonePeDebitResponse debitResponse = callDebitApi(transactionDto);
+
+    PhonePeData phonePeData = PhonePeData.builder()
+            .postURL(properties.getBaseUrl() + properties.getDebitPath())
+            .callbackUrl(properties.getCallbackUrl())
+            .atrn(transactionDto.getAtrnNum())
+            .saltIndex(properties.getSaltIndex())
+            .redirectURL(debitResponse.getData().getRedirectURL())
+            .redirectType(debitResponse.getData().getRedirectType())
+            .mId(properties.getMerchantId())
+            .build();
+
+    return PaymentResponse.<PhonePeData>builder()
+            .status(PaymentConstants.API_RESPONSE_STATUS_SUCCESS)
+            .data(List.of(phonePeData))
+            .build();
+}
+
+/**
+ * Request payload -> JSON string -> Base64 -> order hash (X-VERIFY) -> POST.
+ */
+private PhonePeDebitResponse callDebitApi(TransactionDto transactionDto) {
+    String atrn = transactionDto.getAtrnNum();
+
+    // 1. request payload (amount in PAISE)
+    PhonePeDebitRequest debitRequest = PhonePeDebitRequest.builder()
+            .merchantId(properties.getMerchantId())
+            .transactionId(atrn)
+            .amount(PhonePeUtil.rupeesToPaise(transactionDto.getDebitAmt()))
+            .paymentScope("PHONEPE")
+            .build();
+
+    // 2. convert to string, log, save request log
+    String rawPayload = toJson(debitRequest);
+    logger.info("PhonePe plain request for ATRN {} : {}", atrn, rawPayload);
+    paymentDao.saveRequestLog(rawPayload, atrn,
+            PaymentConstants.WEB_REQUEST_TYPE, PaymentConstants.CREATED_BY_WALLET);
+
+    // 3. Base64 encode and verify the round trip   (FIX: fromBase64, not toBase64)
+    String base64Payload = PhonePeUtil.toBase64(rawPayload);
+    if (!rawPayload.equals(PhonePeUtil.fromBase64(base64Payload))) {
+        throw new PaymentException(PaymentConstants.EXTERNAL_SERVICE_ERROR_CODE,
+                "PhonePe payload encoding failed");
+    }
+    logger.info("PhonePe Base64 payload for ATRN {} : {}", atrn, base64Payload);
+
+    // 4. order hash: SHA256(base64 + checksumPath + saltKey) + ### + saltIndex
+    String xVerify = PhonePeUtil.debitChecksum(base64Payload, properties.getDebitChecksumPath(),
+            properties.getSaltKey(), properties.getSaltIndex());
+
+    // 5. body {"request":"<base64>"} and headers
+    String requestBody = toJson(new PhonePeDebitEnvelope(base64Payload));
+    logger.info("PhonePe request body for ATRN {} : {}", atrn, requestBody);
+
+    Map<String, String> headers = new LinkedHashMap<>();
+    headers.put("Content-Type", "application/json");
+    headers.put("X-VERIFY", xVerify);
+    headers.put("X-CALLBACK-URL", properties.getCallbackUrl());
+
+    // 6. call PhonePe
+    PhonePeDebitResponse response = webClient.initiatePhonePeWebClient(
+            HttpMethod.POST,
+            properties.getBaseUrl() + properties.getDebitPath(),
+            requestBody,
+            PhonePeDebitResponse.class,
+            headers);
+    logger.info("PhonePe debit response for ATRN {} : {}", atrn, toJson(response));
+
+    // 7. decide by code only (per PhonePe team)
+    if (response == null || !"SUCCESS".equalsIgnoreCase(response.getCode())
+            || response.getData() == null || response.getData().getRedirectURL() == null) {
+        throw new PaymentException(PaymentConstants.EXTERNAL_SERVICE_ERROR_CODE,
+                "PhonePe debit failed, code: " + (response == null ? "NO_RESPONSE" : response.getCode()));
+    }
+    return response;
+}
+
+private String toJson(Object o) {
+    try {
+        return objectMapper.writeValueAsString(o);
+    } catch (Exception e) {
+        throw new PaymentException(PaymentConstants.EXTERNAL_SERVICE_ERROR_CODE, "JSON conversion failed");
+    }
+}
