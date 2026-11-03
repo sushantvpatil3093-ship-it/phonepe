@@ -1,0 +1,125 @@
+package com.epay.payment.util;
+
+import com.epay.payment.model.phonepe.PhonePePaymentState;
+
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.Base64;
+import java.util.HexFormat;
+
+public final class PhonePeUtil {
+
+    private static final String SEPARATOR = "###";
+
+    private PhonePeUtil() {
+    }
+
+    /** API 1 Debit: SHA256(base64Payload + checksumPath + saltKey) + ### + saltIndex */
+    public static String debitChecksum(String base64Payload, String checksumPath, String saltKey, String saltIndex) {
+        return sha256Hex(base64Payload + checksumPath + saltKey) + SEPARATOR + saltIndex;
+    }
+
+    /** Status: SHA256(path + saltKey) + ### + saltIndex (as per PhonePe doc) */
+    public static String statusChecksum(String path, String saltKey, String saltIndex) {
+        return sha256Hex(path + saltKey) + SEPARATOR + saltIndex;
+    }
+
+    /** Webhook: SHA256(rawBody + saltKey) + ### + saltIndex (confirm with PhonePe) */
+    public static String webhookChecksum(String rawBody, String saltKey, String saltIndex) {
+        return sha256Hex(rawBody + saltKey) + SEPARATOR + saltIndex;
+    }
+
+    public static String toBase64(String value) {
+        return Base64.getEncoder().encodeToString(value.getBytes(StandardCharsets.UTF_8));
+    }
+
+    public static String fromBase64(String encoded) {
+        return new String(Base64.getDecoder().decode(encoded), StandardCharsets.UTF_8);
+    }
+
+    public static boolean safeEquals(String expected, String actual) {
+        if (expected == null || actual == null) {
+            return false;
+        }
+        return MessageDigest.isEqual(expected.getBytes(StandardCharsets.UTF_8),
+                actual.getBytes(StandardCharsets.UTF_8));
+    }
+
+    /** Rupees (DB) to paise (PhonePe): 100.50 -> 10050 */
+    public static Long rupeesToPaise(BigDecimal rupees) {
+        return rupees.movePointRight(2).setScale(0, RoundingMode.HALF_UP).longValueExact();
+    }
+
+    /** Paise (PhonePe) to rupees: 10050 -> 100.50 */
+    public static BigDecimal paiseToRupees(Long paise) {
+        return BigDecimal.valueOf(paise).movePointLeft(2).setScale(2, RoundingMode.HALF_UP);
+    }
+
+    /** /v4/transaction/{merchantId}/{atrn}/status */
+    public static String buildStatusPath(String statusPathFormat, String merchantId, String atrn) {
+        return String.format(statusPathFormat, merchantId, atrn);
+    }
+
+    public static PhonePePaymentState toPaymentState(String code) {
+        if (code == null) {
+            return PhonePePaymentState.PENDING;
+        }
+        return switch (code) {
+            case "PAYMENT_SUCCESS" -> PhonePePaymentState.SUCCESS;
+            case "PAYMENT_PENDING" -> PhonePePaymentState.PENDING;
+            case "TRANSACTION_NOT_FOUND" -> PhonePePaymentState.NOT_FOUND;
+            default -> PhonePePaymentState.FAILED;   // PAYMENT_ERROR, PAYMENT_DECLINED, etc.
+        };
+    }
+
+    /** Plain SHA-256, lowercase hex. NOT HMAC. */
+    private static String sha256Hex(String data) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            return HexFormat.of().formatHex(digest.digest(data.getBytes(StandardCharsets.UTF_8)));
+        } catch (Exception e) {
+            throw new IllegalStateException("SHA-256 not available", e);
+        }
+    }
+}
+
+
+
+private final PaymentValidator paymentValidator;
+private final PhonePeValidator phonePeValidator;
+private final TransactionDao transactionDao;
+private final PhonePeProperties properties;
+private final PhonePeWebClientService webClient;      // keep only this one
+private final PaymentDao paymentDao;
+private final ObjectMapper objectMapper;
+
+@Transactional
+public PaymentResponse<PhonePeData> generatePhonePeReqPayload(PaymentRequest paymentWebRequest) {
+    PaymentInitiationRequest paymentInitiationRequest = getInitiationRequest(paymentWebRequest);
+    logger.info("PhonePe initiation started for ATRN {}", paymentInitiationRequest.getAtrn());
+    phonePeValidator.validatePhonePeRequest(paymentInitiationRequest);   // was missing
+
+    TransactionDto transactionDto = transactionDao.getValidPaymentAckReq(
+            paymentInitiationRequest.getAtrn(), PaymentStatus.BOOKED.toString(),
+            PaymentConstants.PHONEPE_CONST);
+
+    PhonePeDebitResponse debitResponse = callDebitApi(transactionDto);
+
+    PhonePeData phonePeData = PhonePeData.builder()
+            .postURL(properties.getBaseUrl() + properties.getDebitPath())
+            .callbackUrl(properties.getCallbackUrl())
+            .atrn(transactionDto.getAtrnNum())
+            .saltIndex(properties.getSaltIndex())
+            .redirectURL(debitResponse.getData().getRedirectURL())
+            .redirectType(debitResponse.getData().getRedirectType())
+            .mId(properties.getMerchantId())
+            .build();
+
+    return PaymentResponse.<PhonePeData>builder()
+            .status(PaymentConstants.API_RESPONSE_STATUS_SUCCESS)
+            .data(List.of(phonePeData))
+            .build();
+}
+
