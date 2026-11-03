@@ -1,0 +1,241 @@
+package com.epay.payment.service;
+
+import com.epay.payment.config.PhonePeProperties;
+import com.epay.payment.dao.PaymentDao;
+import com.epay.payment.dao.PhonePeDao;
+import com.epay.payment.dao.TransactionDao;
+import com.epay.payment.dto.TransactionDto;
+import com.epay.payment.exceptions.PaymentException;
+import com.epay.payment.model.phonepe.PhonePePaymentState;
+import com.epay.payment.model.phonepe.request.*;
+import com.epay.payment.model.phonepe.response.*;
+import com.epay.payment.util.*;
+import com.epay.payment.validator.PhonePeValidator;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpMethod;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * PhonePe V4 Debit (SDKless) service: initiation, status and webhook.
+ */
+@Service
+@RequiredArgsConstructor
+public class PhonePeService {
+
+    private final LoggerUtility logger = LoggerFactoryUtility.getLogger(this.getClass());
+
+    private final PhonePeProperties properties;
+    private final PhonePeWebClientService webClient;     // one web client: POST and GET
+    private final PhonePeValidator phonePeValidator;
+    private final PhonePeDao phonePeDao;
+    private final TransactionDao transactionDao;
+    private final PaymentDao paymentDao;
+    private final ObjectMapper objectMapper;
+
+    // =====================================================================
+    // API 1: DEBIT  -> POST {baseUrl}/apis/hermes/v4/debit
+    // =====================================================================
+
+    /**
+     * @param request holds only the atrn
+     * @return PaymentResponse<PhonePeData>
+     * @methodName initiatePayment
+     * @Method-Description Reads amount from DB, calls PhonePe debit, returns redirect data
+     * @Exception PaymentException
+     */
+    @Transactional
+    public PaymentResponse<PhonePeData> initiatePayment(PhonePeInitiationRequest request) {
+        logger.info("PhonePe initiation started for ATRN {}", request.getAtrn());
+        phonePeValidator.validateInitiationRequest(request);
+
+        TransactionDto transactionDto = transactionDao.getValidPaymentAckReq(
+                request.getAtrn(), PaymentStatus.BOOKED.toString(), PaymentConstants.PHONEPE_CONST);
+
+        PhonePeDebitResponse debitResponse = callDebitApi(transactionDto);
+
+        PhonePeData phonePeData = PhonePeData.builder()
+                .postURL(properties.getBaseUrl() + properties.getDebitPath())
+                .callbackUrl(properties.getCallbackUrl())
+                .atrn(transactionDto.getAtrnNum())
+                .saltIndex(properties.getSaltIndex())
+                .redirectURL(debitResponse.getData().getRedirectURL())
+                .redirectType(debitResponse.getData().getRedirectType())
+                .merchantId(properties.getMerchantId())
+                .build();
+
+        return PaymentResponse.<PhonePeData>builder()
+                .status(PaymentConstants.API_RESPONSE_STATUS_SUCCESS)
+                .data(List.of(phonePeData))
+                .build();
+    }
+
+    /**
+     * Request payload -> JSON string -> Base64 -> order hash (X-VERIFY) -> POST.
+     */
+    private PhonePeDebitResponse callDebitApi(TransactionDto transactionDto) {
+        String atrn = transactionDto.getAtrnNum();
+
+        // 1. request payload (amount in PAISE)
+        PhonePeDebitRequest debitRequest = PhonePeDebitRequest.builder()
+                .merchantId(properties.getMerchantId())
+                .transactionId(atrn)
+                .amount(PhonePeUtil.rupeesToPaise(transactionDto.getDebitAmount()))
+                .paymentScope("PHONEPE")
+                .build();
+
+        // 2. convert to string, log, save request log
+        String rawPayload = toJson(debitRequest);
+        logger.info("PhonePe plain request for ATRN {} : {}", atrn, rawPayload);
+        paymentDao.saveRequestLog(rawPayload, atrn,
+                PaymentConstants.WEB_REQUEST_TYPE, PaymentConstants.CREATED_BY_WALLET);
+
+        // 3. Base64 encode and verify the round trip
+        String base64Payload = PhonePeUtil.toBase64(rawPayload);
+        if (!rawPayload.equals(PhonePeUtil.fromBase64(base64Payload))) {
+            throw new PaymentException(PaymentConstants.EXTERNAL_SERVICE_ERROR_CODE,
+                    "PhonePe payload encoding failed");
+        }
+        logger.info("PhonePe Base64 payload for ATRN {} : {}", atrn, base64Payload);
+
+        // 4. order hash: SHA256(base64 + checksumPath + saltKey) + ### + saltIndex
+        String xVerify = PhonePeUtil.debitChecksum(base64Payload, properties.getDebitChecksumPath(),
+                properties.getSaltKey(), properties.getSaltIndex());
+
+        // 5. body {"request":"<base64>"} and headers
+        String requestBody = toJson(new PhonePeDebitEnvelope(base64Payload));
+        logger.info("PhonePe request body for ATRN {} : {}", atrn, requestBody);
+
+        Map<String, String> headers = new LinkedHashMap<>();
+        headers.put("Content-Type", "application/json");
+        headers.put("X-VERIFY", xVerify);
+        headers.put("X-CALLBACK-URL", properties.getCallbackUrl());
+
+        // 6. call PhonePe
+        PhonePeDebitResponse response = webClient.initiatePhonePeWebClient(
+                HttpMethod.POST,
+                properties.getBaseUrl() + properties.getDebitPath(),
+                requestBody,
+                PhonePeDebitResponse.class,
+                headers);
+        logger.info("PhonePe debit response for ATRN {} : {}", atrn, toJson(response));
+
+        // 7. decide by code only (per PhonePe team)
+        if (response == null || !"SUCCESS".equalsIgnoreCase(response.getCode())
+                || response.getData() == null || response.getData().getRedirectURL() == null) {
+            throw new PaymentException(PaymentConstants.EXTERNAL_SERVICE_ERROR_CODE,
+                    "PhonePe debit failed, code: " + (response == null ? "NO_RESPONSE" : response.getCode()));
+        }
+        return response;
+    }
+
+    // =====================================================================
+    // API 2: STATUS -> GET {statusBaseUrl}/v4/transaction/{merchantId}/{atrn}/status
+    // =====================================================================
+
+    /**
+     * @param request holds only the atrn
+     * @return PaymentResponse<PhonePeStatusResponseDto>
+     * @methodName getPaymentStatus
+     * @Method-Description Calls PhonePe status API and updates our tables
+     */
+    @Transactional
+    public PaymentResponse<PhonePeStatusResponseDto> getPaymentStatus(PhonePeStatusRequest request) {
+        phonePeValidator.validateStatusRequest(request);
+        PhonePeTransactionStatusResponse statusResponse = callStatusApi(request.getAtrn());
+        PhonePePaymentState state = processPaymentResult(request.getAtrn(), statusResponse);
+
+        PhonePeStatusResponseDto dto = PhonePeStatusResponseDto.builder()
+                .atrn(request.getAtrn())
+                .code(statusResponse.getCode())
+                .state(state.name())
+                .build();
+
+        return PaymentResponse.<PhonePeStatusResponseDto>builder()
+                .status(PaymentConstants.API_RESPONSE_STATUS_SUCCESS)
+                .data(List.of(dto))
+                .build();
+    }
+
+    private PhonePeTransactionStatusResponse callStatusApi(String atrn) {
+        String path = PhonePeUtil.buildStatusPath(properties.getStatusPath(), properties.getMerchantId(), atrn);
+        String xVerify = PhonePeUtil.statusChecksum(path, properties.getSaltKey(), properties.getSaltIndex());
+
+        Map<String, String> headers = new LinkedHashMap<>();
+        headers.put("Content-Type", "application/json");
+        headers.put("X-VERIFY", xVerify);
+        headers.put("X-MERCHANT-ID", properties.getMerchantId());
+
+        PhonePeTransactionStatusResponse response = webClient.initiatePhonePeWebClient(
+                HttpMethod.GET, properties.getStatusBaseUrl() + path, null,
+                PhonePeTransactionStatusResponse.class, headers);
+        logger.info("PhonePe status response for ATRN {} : {}", atrn, toJson(response));
+        return response;
+    }
+
+    // =====================================================================
+    // WEBHOOK: PhonePe calls us
+    // =====================================================================
+
+    /**
+     * @param rawBody raw webhook body
+     * @param xVerify X-VERIFY header, optional
+     * @methodName processWebhook
+     * @Method-Description Takes ATRN from body, confirms with status API, updates tables
+     */
+    @Transactional
+    public void processWebhook(String rawBody, String xVerify) {
+        logger.info("PhonePe webhook received: {}", rawBody);
+        if (properties.isWebhookVerifyEnabled()) {
+            phonePeValidator.validateWebhookChecksum(rawBody, xVerify);
+        }
+        PhonePeTransactionStatusResponse webhookData = parseWebhook(rawBody);
+        String atrn = webhookData.getData().getMerchantTransactionId();
+
+        PhonePeTransactionStatusResponse result =
+                properties.isWebhookConfirmWithStatus() ? callStatusApi(atrn) : webhookData;
+        processPaymentResult(atrn, result);
+    }
+
+    // =====================================================================
+    // common helpers
+    // =====================================================================
+
+    private PhonePePaymentState processPaymentResult(String atrn, PhonePeTransactionStatusResponse response) {
+        PhonePePaymentState state = PhonePeUtil.toPaymentState(response.getCode());
+        if (state == PhonePePaymentState.PENDING || state == PhonePePaymentState.NOT_FOUND) {
+            return state;                                  // keep checking status later
+        }
+        if (state == PhonePePaymentState.SUCCESS) {
+            phonePeValidator.validateDebitAmount(phonePeDao.getDebitAmountByAtrn(atrn),
+                    PhonePeUtil.paiseToRupees(response.getData().getAmount()).toPlainString());
+        }
+        phonePeDao.updatePaymentResult(atrn, state, response);   // locked and idempotent
+        return state;
+    }
+
+    private PhonePeTransactionStatusResponse parseWebhook(String rawBody) {
+        try {
+            JsonNode node = objectMapper.readTree(rawBody);
+            String json = node.has("response")
+                    ? PhonePeUtil.fromBase64(node.get("response").asText()) : rawBody;
+            return objectMapper.readValue(json, PhonePeTransactionStatusResponse.class);
+        } catch (Exception e) {
+            throw new PaymentException(PaymentConstants.EXTERNAL_SERVICE_ERROR_CODE, "Invalid PhonePe webhook body");
+        }
+    }
+
+    private String toJson(Object o) {
+        try {
+            return objectMapper.writeValueAsString(o);
+        } catch (Exception e) {
+            throw new PaymentException(PaymentConstants.EXTERNAL_SERVICE_ERROR_CODE, "JSON conversion failed");
+        }
+    }
+}
