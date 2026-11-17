@@ -1,0 +1,407 @@
+package com.epay.payment.service;
+
+
+import com.epay.payment.config.PhonePeProperties;
+import com.epay.payment.dao.PaymentDao;
+import com.epay.payment.dao.TransactionDao;
+import com.epay.payment.dto.CardOnBoardDetailsResponseDto;
+import com.epay.payment.dto.TransactionDto;
+import com.epay.payment.entity.PhonePeData;
+import com.epay.payment.entity.PostingData;
+import com.epay.payment.exceptions.PaymentException;
+import com.epay.payment.externalservice.PhonePeWebClientService;
+
+import com.epay.payment.model.request.*;
+import com.epay.payment.model.response.*;
+import com.epay.payment.util.CardErrorConstants;
+import com.epay.payment.util.PaymentConstants;
+import com.epay.payment.util.PhonePeUtil;
+import com.epay.payment.util.enums.PaymentStatus;
+import com.epay.payment.util.enums.TransactionStatus;
+import com.epay.payment.validator.PaymentValidator;
+import com.epay.payment.validator.PhonePeValidator;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.gson.Gson;
+import com.sbi.epay.logging.utility.LoggerFactoryUtility;
+import com.sbi.epay.logging.utility.LoggerUtility;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpMethod;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.math.BigDecimal;
+import java.text.MessageFormat;
+import java.util.*;
+
+/**
+ * Class Name: PhonePeService
+ * *
+ * Description: PhonePeService class
+ * *
+ * Author: Sushant Patil-V1024346
+ * Copyright (c) 2026 [State Bank of India]
+ * ALl rights reserved
+ * *
+ * Version: 1.0
+ */
+@Service
+@RequiredArgsConstructor
+public class PhonePeService {
+
+    private final LoggerUtility logger = LoggerFactoryUtility.getLogger(this.getClass());
+    private final PaymentValidator paymentValidator;
+    private final PhonePeValidator phonePeValidator;
+    private final TransactionDao transactionDao;
+    private final PhonePeProperties properties;
+    private final PhonePeWebClientService phonePeWebClientService;
+    private final PhonePeUtil phonePeUtil;
+    private final PaymentDao paymentDao;
+    private final ObjectMapper objectMapper;
+
+    /**
+     * @param paymentRequest holds only the atrn
+     * @return PaymentResponse<PostingData>
+     * @methodName generatePhonePeReqPayload
+     * @Method-Description Reads amount from DB, calls PhonePe debit, returns redirect data
+     * @Exception PaymentException
+     */
+    @Transactional
+    public PaymentResponse<PostingData> generatePhonePeReqPayload(PaymentRequest paymentRequest) {
+        PaymentInitiationRequest paymentInitiationRequest = PaymentInitiationRequest.builder().atrn(paymentRequest.getAtrn()).paymode(PaymentConstants.WALLET_CONST).build();
+        logger.info("PhonePe initiation started for ATRN {}", paymentInitiationRequest.getAtrn());
+        phonePeValidator.validatePhonePeRequest(paymentInitiationRequest);
+        logger.info("PhonePe initiation validation completed for ATRN {}", paymentInitiationRequest.getAtrn());
+        TransactionDto transactionDto = transactionDao.getValidPaymentAckReq(paymentRequest.getAtrn(), PaymentStatus.BOOKED.toString(),PaymentConstants.WALLET_CONST);
+        logger.info("PhonePe initiation transactionDto {} for ATRN {} ",transactionDto,transactionDto.getAtrnNum());
+        paymentValidator.validateDebitAmount(transactionDto.getDebitAmt());
+        logger.info("PhonePe initiation Amount validated successfully for ATRN {}",paymentRequest.getAtrn());
+        String finalRequestString = proccessPhonePeDebitRequest(transactionDto);
+        logger.info("PhonePe initiation request body successfully generated finalRequestString for ATRN {}",finalRequestString,paymentRequest.getAtrn());
+        PhonePeDebitResponse getPhonePeIntentData = processPhonePeIntentRequest(finalRequestString,transactionDto);
+        PostingData postingData = PostingData.builder().postURL(getPhonePeIntentData.getData().getRedirectURL()).atrn(transactionDto.getAtrnNum()).build();
+        logger.info("PhonePe Initiation redirect Url {} , and ATRN {}", postingData.getPostURL(),transactionDto.getAtrnNum());
+        return PaymentResponse.<PostingData>builder().status(PaymentConstants.API_RESPONSE_STATUS_SUCCESS).data(List.of(postingData)).build();
+    }
+
+    /**
+     * @return: String
+     * @methodName: processPhonePeIntentRequest
+     * @@Method-Description: Process debit api request
+     * @param: requestBody,transactionDto
+     * @Exception: or @Error :Exception
+     */
+    public PhonePeDebitResponse processPhonePeIntentRequest(String requestBody,TransactionDto transactionDto){
+        String xVerify = phonePeUtil.debitChecksum(requestBody, properties.getDebitChecksumPath(),properties.getSaltKey(), properties.getSaltIndex());
+        paymentDao.saveRequestLog(toJson(new PhonePeDebitEnvelope(requestBody)),transactionDto.getAtrnNum(), PaymentConstants.PHONE_PE_CALL_DEBIT_API,PaymentConstants.CREATED_BY_PHONE_PE);
+        HashMap<String, String> cardRequestHeaders = phonePeUtil.createDebitApiRequestHeader(xVerify,properties.getCallbackUrl());
+        String debitApiResponse = phonePeWebClientService.initiateWebClient(properties.getDebitPath(), toJson(new PhonePeDebitEnvelope(requestBody)), String.class, cardRequestHeaders);
+        logger.info("PhonePe debitApiResponse Response {} for reference no {} ",debitApiResponse,transactionDto.getAtrnNum());
+        PhonePeDebitResponse phonePeDebitResponse = new Gson().fromJson(debitApiResponse, PhonePeDebitResponse.class);
+        paymentDao.saveResponseLog(phonePeDebitResponse.toString(),transactionDto.getAtrnNum(),transactionDto.getAtrnNum(),PaymentConstants.ALTID_RESP,PaymentConstants.CREATED_BY_PHONE_PE);
+        return Optional.of(phonePeDebitResponse).orElseThrow(() -> new PaymentException(CardErrorConstants.PROCESS_SERVICE_ERROR_CODE, MessageFormat.format(CardErrorConstants.PROCESS_SERVICE_ERROR_MESSAGE,PaymentConstants.PHONE_PE_CALL_DEBIT_API)));
+    }
+
+    /**
+     * Request payload -> JSON string -> Base64 -> order hash (X-VERIFY) -> POST.
+     */
+    public String proccessPhonePeDebitRequest(TransactionDto transactionDto) {
+        // 1. request payload (amount in PAISE)
+        PhonePeDebitRequest debitRequest = PhonePeDebitRequest.builder()
+                .merchantId(properties.getMerchantId()) //mid should be dynamic need to fetch from db
+                .subMerchantId(properties.getMerchantId()+"123")
+                .transactionId(transactionDto.getAtrnNum())
+                .amount(phonePeUtil.rupeesToPaise(transactionDto.getDebitAmt()))
+                .mcc(PaymentConstants.PHONE_PE_MCC)
+                .merchantUserId(PaymentConstants.PHONE_PE_USER_ID)
+                .mobileNumber(PaymentConstants.DUMMY_PHONE)
+                .message(PaymentConstants.PHONE_PE_MSG)
+                .email(PaymentConstants.emailConst)
+                .paymentScope(PaymentConstants.PHONEPE_CONST)
+                .build();
+        logger.info("PhonePe plain request debitRequest for ATRN {} : {}",debitRequest, transactionDto.getAtrnNum());
+        // 2. convert to string, log, save request log
+        String rawPayload = toJson(debitRequest);
+        logger.info("PhonePe plain request for ATRN {} : {}", rawPayload,transactionDto.getAtrnNum());
+        // 3. Base64 encode and verify the round trip   (FIX: fromBase64, not toBase64)
+        return  phonePeUtil.toBase64(rawPayload);
+    }
+
+    private String toJson(Object o) {
+        try {
+            return objectMapper.writeValueAsString(o);
+        } catch (Exception e) {
+            throw new PaymentException(PaymentConstants.EXTERNAL_SERVICE_ERROR_CODE, "JSON conversion failed");
+        }
+    }
+}
+
+
+
+
+
+
+
+package com.epay.payment.util;
+
+
+
+
+import com.epay.payment.util.enums.PhonePePaymentState;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Component;
+
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.Base64;
+import java.util.HashMap;
+import java.util.HexFormat;
+
+@Component
+@RequiredArgsConstructor
+public class PhonePeUtil {
+
+    private final String SEPARATOR = "###";
+
+    /** API 1 Debit: SHA256(base64Payload + checksumPath + saltKey) + ### + saltIndex */
+     public String debitChecksum(String base64Payload, String checksumPath, String saltKey, String saltIndex) {
+        return sha256Hex(base64Payload + checksumPath + saltKey) + SEPARATOR + saltIndex;
+    }
+
+    /** Status: SHA256(path + saltKey) + ### + saltIndex (as per PhonePe doc) */
+    public String statusChecksum(String path, String saltKey, String saltIndex) {
+        return sha256Hex(path + saltKey) + SEPARATOR + saltIndex;
+    }
+
+    /** Webhook: SHA256(rawBody + saltKey) + ### + saltIndex (confirm with PhonePe) */
+    public String webhookChecksum(String rawBody, String saltKey, String saltIndex) {
+        return sha256Hex(rawBody + saltKey) + SEPARATOR + saltIndex;
+    }
+
+    public String toBase64(String value) {
+        return Base64.getEncoder().encodeToString(value.getBytes(StandardCharsets.UTF_8));
+    }
+
+    public String fromBase64(String encoded) {
+        return new String(Base64.getDecoder().decode(encoded), StandardCharsets.UTF_8);
+    }
+
+    public boolean safeEquals(String expected, String actual) {
+        if (expected == null || actual == null) {
+            return false;
+        }
+        return MessageDigest.isEqual(expected.getBytes(StandardCharsets.UTF_8),
+                actual.getBytes(StandardCharsets.UTF_8));
+    }
+
+    /** Rupees (DB) to paise (PhonePe): 100.50 -> 10050 */
+    public Long rupeesToPaise(BigDecimal rupees) {
+        return rupees.movePointRight(2).setScale(0, RoundingMode.HALF_UP).longValueExact();
+    }
+
+    /** Paise (PhonePe) to rupees: 10050 -> 100.50 */
+    public BigDecimal paiseToRupees(Long paise) {
+        return BigDecimal.valueOf(paise).movePointLeft(2).setScale(2, RoundingMode.HALF_UP);
+    }
+
+    /** /v4/transaction/{merchantId}/{atrn}/status */
+    public String buildStatusPath(String statusPathFormat, String merchantId, String atrn) {
+        return String.format(statusPathFormat, merchantId, atrn);
+    }
+
+    public PhonePePaymentState toPaymentState(String code) {
+        if (code == null) {
+            return PhonePePaymentState.PENDING;
+        }
+        return switch (code) {
+            case "PAYMENT_SUCCESS" -> PhonePePaymentState.SUCCESS;
+            case "PAYMENT_PENDING" -> PhonePePaymentState.PENDING;
+            case "TRANSACTION_NOT_FOUND" -> PhonePePaymentState.NOT_FOUND;
+            default -> PhonePePaymentState.FAILED;   // PAYMENT_ERROR, PAYMENT_DECLINED, etc.
+        };
+    }
+
+    /** Plain SHA-256, lowercase hex. NOT HMAC. */
+    private String sha256Hex(String data) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            return HexFormat.of().formatHex(digest.digest(data.getBytes(StandardCharsets.UTF_8)));
+        } catch (Exception e) {
+            throw new IllegalStateException("SHA-256 not available", e);
+        }
+    }
+
+    /**
+     * @return: HashMap<String, String>
+     * @methodName: createDebitApiRequestHeader
+     * @@Method-Description: Process setting header
+     * @param: xVerify,callbackUrl
+     * @Exception: or @Error :Exception
+     */
+    public HashMap<String, String> createDebitApiRequestHeader(String xVerify, String callbackUrl) {
+        HashMap<String, String> requestHeaders = new HashMap<>();
+        requestHeaders.put(PaymentConstants.REQUESTPROPERTY, PaymentConstants.APPLICATION_JSON);
+        requestHeaders.put(PaymentConstants.PHONE_PE_X_VERIFY, xVerify);
+        requestHeaders.put(PaymentConstants.PHONE_PE_CALLBACK, callbackUrl);
+        return requestHeaders;
+    }
+}
+
+
+
+
+package com.epay.payment.validator;
+
+import com.epay.payment.model.request.PaymentInitiationRequest;
+import com.epay.payment.util.ErrorConstants;
+import com.epay.payment.util.PaymentConstants;
+import com.sbi.epay.logging.utility.LoggerFactoryUtility;
+import com.sbi.epay.logging.utility.LoggerUtility;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Component;
+
+import java.math.BigDecimal;
+import java.text.MessageFormat;
+import static com.epay.payment.util.PaymentConstants.*;
+
+@Component
+@RequiredArgsConstructor
+public class PhonePeValidator extends BaseValidator {
+    private final LoggerUtility logger = LoggerFactoryUtility.getLogger(this.getClass());
+
+
+    public void validatePhonePeRequest(PaymentInitiationRequest paymentInitiationRequest) {
+        errorDtoList.clear();
+        checkMandatoryField(paymentInitiationRequest.getAtrn(), PaymentConstants.ATRN_CONST);
+
+        checkForLeadingTrailingAndSingleSpace(paymentInitiationRequest.getAtrn(), PaymentConstants.ATRN_CONST);
+
+        validateFieldLength(paymentInitiationRequest.getAtrn(), ATRN_LENGTH, PaymentConstants.ATRN_CONST);
+
+        validateFieldWithRegex(paymentInitiationRequest.getAtrn(), PaymentConstants.ATRN_ARRN_REGEX_DIGIT, PaymentConstants.ATRN_CONST, PaymentConstants.INVALID_ATRN_CONST);
+    }
+
+    public void validateCurrencyCode(String currencyCode) {
+        errorDtoList.clear();
+        boolean inr = PaymentConstants.INR_CURRENCY.equalsIgnoreCase(currencyCode);
+        if (!inr) {
+            addError(ErrorConstants.INVALID_ERROR_CODE, MessageFormat.format(ErrorConstants.INVALID_ERROR_MESSAGE,
+                    PaymentConstants.CURRENCY_CONST, PaymentConstants.INR_CURRENCY));
+        }
+    }
+
+
+
+    private BigDecimal toBigDecimal(String value) {
+        try {
+            return value == null ? null : new BigDecimal(value.trim());
+        } catch (NumberFormatException e) {
+            logger.info("Invalid amount value received :: {} ", value);
+            return null;
+        }
+    }
+}
+
+
+
+
+package com.epay.payment.externalservice;
+
+import com.epay.payment.config.CardConfigDeatils;
+import com.epay.payment.exceptions.PaymentException;
+import com.epay.payment.util.ErrorConstants;
+import com.epay.payment.util.PaymentConstants;
+import com.sbi.epay.logging.utility.LoggerFactoryUtility;
+import com.sbi.epay.logging.utility.LoggerUtility;
+import io.netty.handler.ssl.SslContext;
+import io.netty.handler.ssl.SslContextBuilder;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.client.reactive.ReactorClientHttpConnector;
+import org.springframework.stereotype.Component;
+import org.springframework.web.reactive.function.client.WebClient;
+import reactor.core.publisher.Mono;
+import reactor.netty.http.client.HttpClient;
+import reactor.netty.transport.ProxyProvider;
+
+import java.text.MessageFormat;
+import java.util.HashMap;
+import java.util.function.Supplier;
+
+/**
+ * Class Name:PhonePeWebClientService
+ * *
+ * Description: Phone pe Payment Service
+ * *
+ * Author: Sushant Patil
+ * Copyright (c) 2026 [State Bank of India]
+ * All rights reserved
+ * *
+ * Version:1.0
+ */
+@RequiredArgsConstructor
+@Component
+public class PhonePeWebClientService {
+
+    private final CardConfigDeatils cardConfigDeatils;
+    LoggerUtility logger = LoggerFactoryUtility.getLogger(this.getClass());
+
+    public <T> T initiateWebClient(String url, String requestPayload, Class<T> responseDto, HashMap<String, String> requestHeaders) {
+
+        logger.info("PhonePe URL and Request headers ::  {} {}", url, requestHeaders);
+        try {
+            SslContext sslContextForTls12 = SslContextBuilder.forClient()
+                    .protocols(PaymentConstants.protocols)
+                    .build();
+
+            HttpClient httpClient =
+                    HttpClient.create()
+                            .proxy(proxy -> proxy.type(ProxyProvider.Proxy.HTTP)
+                                    .host(cardConfigDeatils.getHttps_proxyHost())
+                                    .port(Integer.parseInt(cardConfigDeatils.getHttps_proxyPort()))).secure(ssl -> ssl.sslContext(sslContextForTls12));
+
+            WebClient webClient;
+
+            if (PaymentConstants.YES.equalsIgnoreCase(cardConfigDeatils.getProxyRequired())) {
+                webClient = WebClient.builder()
+                        .clientConnector(new ReactorClientHttpConnector(httpClient))
+                        .baseUrl(url)
+                        .defaultHeader(HttpHeaders.ORIGIN, cardConfigDeatils.getCorsOrigin())
+                        .build();
+            } else {
+                webClient = WebClient.builder()
+                        .baseUrl(url)
+                        .defaultHeader(HttpHeaders.ORIGIN, cardConfigDeatils.getCorsOrigin())
+                        .build();
+            }
+
+            return webClient.post().headers(httpHeaders -> requestHeaders.forEach(httpHeaders::add))
+
+                    .bodyValue(requestPayload).retrieve().onStatus(status -> {
+                                logger.info("PhonePe Response-code  received ::  {} ", status);
+                                return !status.is2xxSuccessful();
+                            },
+                            clientResponse ->
+                                    clientResponse.bodyToMono(String.class)
+                                            .flatMap(errorBody -> Mono.error(((Supplier<RuntimeException>) () -> new PaymentException(ErrorConstants.EXTERNAL_SERVICE_ERROR_CODE, MessageFormat.format(ErrorConstants.EXTERNAL_SERVICE_ERROR_MESSAGE, PaymentConstants.CREATED_BY_PHONE_PE))).get()
+                                            ))
+                    ).bodyToMono(responseDto).
+                    doOnNext(body -> {
+                        logger.info("PhonePe Response received  :  {} ", body);
+                    }).map(body -> {
+                        logger.info("PhonePe Received processing Response :  {} ", body);
+                        return body;
+                    }).doOnError(error -> {
+                        logger.error("Error while getting:: PhonePe Response ::  {} ", error);
+                    }).onErrorResume(error -> {
+                        logger.error("Error processing  while getting:: PhonePe Response ::  {} ", error);
+                        return Mono.error(() -> new PaymentException(ErrorConstants.EXTERNAL_SERVICE_ERROR_CODE, MessageFormat.format(ErrorConstants.EXTERNAL_SERVICE_ERROR_MESSAGE, PaymentConstants.CREATED_BY_PHONE_PE)));
+                    }).block(); //SYNCHRONOUS CALLING--
+        } catch (Exception e) { // Exception throw by PhonePe
+            logger.error("Exception While initiateWebClient  {}", e);
+            throw new PaymentException(ErrorConstants.EXTERNAL_SERVICE_ERROR_CODE, MessageFormat.format(ErrorConstants.EXTERNAL_SERVICE_ERROR_MESSAGE, PaymentConstants.CREATED_BY_PHONE_PE));
+        }
+    }
+
+}
