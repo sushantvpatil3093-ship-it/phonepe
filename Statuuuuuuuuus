@@ -1,0 +1,254 @@
+E-Pay Report Service (Status Query)
+Author To be updated
+First Reviewed By To be updated
+Final Reviewed By
+Approved By
+Contact Person
+Frequency of Document Review Next Revision of Standard Documents
+Document Creation Date 21-11-2026
+Last Updated Date 21-11-2026
+Revision History
+Version Date Name Comments
+0.1 21-11-2026 To be updated Draft Version
+
+
+
+
+
+
+
+Contents
+Sr. No. Description Page
+1. Document Purpose 4
+1.1 Technical Design 4
+1.1.1 Technology Stack 4
+1.2 Generic Class Flow 5
+1.3 Generic Class Definition 5
+2. Pre-Requisite 6
+2.1 Data Description 6
+3. Status Query Process 7
+3.1 Request and Response Logging 7
+3.2 Validation 8
+3.3 Business Logic 8
+3.4 Database Table for Status Query Log 9
+3.5 Sample Request and Response 9
+4. Error Code 10
+
+
+
+
+
+Document Purpose
+The purpose of the Status Query feature is to retrieve the transaction status using the transaction and order details provided in the request.
+The system processes the Status Query request, receives the transaction status response and stores both request and response details in the database for audit tracking and future reference.
+1.1 Technical Design
+1.1.1 Technology Stack
+
+
+
+
+
+Technical Design
+1.1.1 Technology Stack
+Sr. No. Technology Version / Details
+1 Java Project configured version
+2 Spring Boot Project configured version
+3 Spring Data JPA Database interaction
+4 Lombok Getter, Setter and Builder
+5 Oracle Database Oracle DB
+6 Liquibase Database change management
+7 Maven/Gradle As configured in project
+
+
+
+
+
+PAGE 4 – GENERIC CLASS FLOW AND CLASS DEFINITION
+1.2 Generic Class Flow Diagram
+       Status Query Request
+                |
+                |
+                v
+       Receive Request Data
+                |
+                |
+                v
+       Decrypt Request Data
+                |
+                |
+                v
+       Map Request to DTO
+                |
+                |
+                v
+       Process Status Query
+                |
+                |
+                v
+       Receive Status Response
+                |
+                |
+                v
+       Save Request Log
+                |
+                |
+                v
+       Save Response Log
+                |
+                |
+                v
+       Store Logs in Database
+                |
+                |
+                v
+       Return Status Response
+
+
+
+
+
+
+
+1 StatusQueryDao This class handles the database logging operation for Status Query requests and responses.
+2 OrderStatusDto This DTO contains the order details required for processing the Status Query request.
+3 StatusQueryLogDto This DTO is used to prepare request and response log information before saving it into the database.
+4 StatusQueryLogMapper This mapper converts StatusQueryLogDto into the StatusQueryLog entity object.
+5 StatusQueryRepository This repository performs database operations for Status Query log records.
+6 StatusQueryLog This entity represents the Status Query log database table.
+7 EPayIdentityUtil This utility retrieves the authenticated merchant information.
+Service Layer
+
+
+
+
+The service layer handles the business logic of the application and coordinates the Status Query processing flow.
+DAO Layer
+The DAO layer handles database interaction and saves the request and response log information.
+Repository Layer
+The repository layer provides database access using Spring Data JPA.
+DTO Object
+A Data Transfer Object is used to transfer request and response data between application layers.
+Entity Object
+An entity object represents a database table, and each instance corresponds to a database record.
+
+
+
+
+
+
+
+PAGE 5 – PRE-REQUISITE AND DATA DESCRIPTION
+2. Pre-Requisite
+The prerequisite stage establishes the foundation for the Status Query process. It ensures that the required request information and database configurations are available.
+Status Query request data should be available in the expected request format.
+Request data should be decrypted before saving the request log.
+Oracle database connectivity should be available.
+Status Query log table should be created in the database.
+Repository and entity mapping should be configured.
+Authenticated merchant information should be available.
+
+
+
+
+
+
+2.1 Data Description
+The following fields are available in the supplied OrderStatusDto class.
+Sr. No. Field Name Data Type Description
+1 orderRefNumber String Merchant order reference number.
+2 orderAmount BigDecimal Transaction order amount.
+3 sbiOrderRefNumber String SBI ePay order reference number.
+4 atrnNumber String Transaction reference number.
+DTO Class Structure
+public class OrderStatusDto {
+
+    private String orderRefNumber;
+
+    @NotNull(message = "ORDER_AMOUNT_IS_REQUIRED")
+    private BigDecimal orderAmount;
+
+    private String sbiOrderRefNumber;
+
+    private String atrnNumber;
+}
+
+
+
+
+
+
+
+Check whether the response list is available and not empty before accessing its first element.
+Retrieve ATRN number from the response payment information, when available.
+Retrieve SBI order reference number from the response order information.
+Retrieve merchant ID using EPayIdentityUtil.
+Convert the response list into JSON format.
+Convert JSON response into bytes and store it in the LOG field.
+Set CREATED_BY as STATUS_QUERY_RESPONSE.
+Convert DTO into entity using StatusQueryLogMapper.
+Save the response log using StatusQueryRepository.
+
+
+
+
+
+PAGE 7 – VALIDATION AND BUSINESS LOGIC
+3.2 Validation
+Sr. No. Validation Description
+1 Order Amount Order amount is mandatory as per the supplied DTO annotation.
+2 Request Data Decrypted request data is used for request logging.
+3 Response List Response list is checked before accessing its first element.
+4 Merchant ID Merchant ID is retrieved from the authenticated user context.
+5 Database Request and response logs are saved using the repository.
+
+
+
+
+
+
+
+
+The response information is saved in the Status Query log table.
+Merchant ID and created-by information are maintained for audit tracking.
+The saved request and response logs can be used for future reference and troubleshooting.
+Log Identification
+Sr. No. Field Value
+1 Request Log STATUS_QUERY_REQUEST
+2 Response Log STATUS_QUERY_RESPONSE
+3 Merchant ID Retrieved from authenticated user
+4 Log Data Stored as byte array in BLOB
+
+
+
+
+
+
+10 PARTITION_DATE DATE
+Database Description
+Primary key is maintained using the ID column.
+SYS_GUID() is used for unique ID generation.
+LOG column stores request and response information in BLOB format.
+CREATED_BY identifies whether the record belongs to a request or response.
+The table uses range partitioning based on PARTITION_DATE with monthly interval partitions, as shown in the supplied SQL screenshot.
+PAGE 9 – SAMPLE REQUEST AND RESPONSE
+3.5 Sample Request and Response
+Sample Request JSON
+{
+  "orderAmount": 50,
+  "orderRefNumber": "0900001110",
+  "sbiOrderRefNumber": "",
+  "atrnNumber": ""
+}
+
+
+
+
+
+
+4. Error Code
+Sr. No. Error Code Error Message Template Description
+1 To be confirmed To be confirmed Status Query-specific error details are not available in the supplied code screenshots.
+Note:
+The actual Status Query error codes and error messages should be updated based on the API/service implementation.
+
+
