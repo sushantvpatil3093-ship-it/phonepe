@@ -1,0 +1,196 @@
+/**
+ * @param rawBody webhook body sent by PhonePe
+ * @methodName processPhonePeWebhook
+ * @Method-Description Server to server webhook. Takes the atrn, verifies with the status api and updates the tables
+ * @Exception PaymentException
+ */
+@Transactional
+public void processPhonePeWebhook(String rawBody) {
+    logger.info("PhonePe webhook received {}", rawBody);
+    PhonePeWebhookResponse webhook = convertWebhookToDto(rawBody);
+    String atrn = webhook.getData().getTransactionId();
+    paymentDao.saveResponseLog(rawBody, atrn, webhook.getData().getProviderReferenceId(),
+            PaymentConstants.WEB_RESPONSE_TYPE, PaymentConstants.CREATED_BY_PHONE_PE);
+    phonePeVerifyAndUpdate(atrn);
+}
+
+/**
+ * @param paymentRequest holds only the atrn
+ * @return RedirectView, or null while the payment is still pending
+ * @methodName processPhonePeReturn
+ * @Method-Description User comes back from PhonePe. Verifies and redirects to the merchant
+ */
+@Transactional
+public RedirectView processPhonePeReturn(PaymentRequest paymentRequest) {
+    PhonePeVerifyResult result = phonePeVerifyAndUpdate(paymentRequest.getAtrn());
+    if (result.state() == PhonePePaymentState.PENDING || result.state() == PhonePePaymentState.NOT_FOUND) {
+        return null;                       // front end keeps checking, see note below
+    }
+    TransactionDto transactionDto = transactionDao.getTransactionDetails(paymentRequest.getAtrn());
+    PaymentFinalResponse paymentFinalResponse = getPhonePeFinalResponse(transactionDto, result);
+    RedirectView redirectView = new RedirectView();
+    redirectView.setUrl(paymentCallbackForwardService.getRedirectionUrl(transactionDto)
+            .concat(PaymentConstants.MERCHANT_FINAL_RESPONSE)
+            .concat(Base64.getEncoder().encodeToString(
+                    paymentCallbackForwardService.processCallbackResponse(paymentFinalResponse,
+                            orderDao.getOrderDetails(transactionDto)).getBytes())));
+    return redirectView;
+}
+
+/** Double verification: status api, then checks, then DB update. Safe to call many times. */
+@Transactional
+public PhonePeVerifyResult phonePeVerifyAndUpdate(String atrn) {
+    TransactionDto transactionDto = transactionDao.getTransactionDetails(atrn);
+    if (!PaymentStatus.BOOKED.toString().equalsIgnoreCase(transactionDto.getTransactionStatus())) {
+        logger.info("PhonePe ATRN {} already processed, status {}", atrn, transactionDto.getTransactionStatus());
+        return new PhonePeVerifyResult(PhonePeUtil.toFinalState(transactionDto), null, null);
+    }
+    PhonePeTransactionStatusResponse status = fetchPhonePeStatus(transactionDto);
+    PhonePePaymentState state = phonePeUtil.toPaymentState(status.getCode());   // decide by code only
+    String providerRef = status.getData() == null ? null : status.getData().getTransactionId();
+    paymentDao.saveResponseLog(toJson(status), atrn, providerRef,
+            PaymentConstants.WEB_RESPONSE_TYPE, PaymentConstants.CREATED_BY_PHONE_PE);
+
+    if (state == PhonePePaymentState.PENDING || state == PhonePePaymentState.NOT_FOUND) {
+        return new PhonePeVerifyResult(state, status.getMessage(), providerRef);   // keep checking later
+    }
+    if (state == PhonePePaymentState.FAILED) {
+        statusUpdatePaymentDao.paymentFailureStatusUpdate(atrn, providerRef, status.getMessage(),
+                PaymentConstants.PHONEPE_WALLET_BANKING);
+        return new PhonePeVerifyResult(state, status.getMessage(), providerRef);
+    }
+    // SUCCESS: same checks as validateCallBackResponse
+    if (providerRef == null || providerRef.isBlank()) {
+        statusUpdatePaymentDao.paymentFailureStatusUpdate(atrn, providerRef,
+                WalletErrorConstant.BANK_REF_NO_ERROR_MESSAGE, PaymentConstants.PHONEPE_WALLET_BANKING);
+        return new PhonePeVerifyResult(PhonePePaymentState.FAILED, WalletErrorConstant.BANK_REF_NO_ERROR_MESSAGE, providerRef);
+    }
+    BigDecimal paidRupees = phonePeUtil.paiseToRupees(status.getData().getAmount());
+    if (transactionDto.getDebitAmt().compareTo(paidRupees) != 0) {
+        statusUpdatePaymentDao.paymentFailureStatusUpdate(atrn, providerRef,
+                WalletErrorConstant.AMOUNT_ERROR_MESSAGE, PaymentConstants.PHONEPE_WALLET_BANKING);
+        return new PhonePeVerifyResult(PhonePePaymentState.FAILED, WalletErrorConstant.AMOUNT_ERROR_MESSAGE, providerRef);
+    }
+    phonePeDao.processPhonePeSuccess(transactionDto, providerRef, status);   // see "What I need"
+    return new PhonePeVerifyResult(state, status.getMessage(), providerRef);
+}
+
+private PhonePeTransactionStatusResponse fetchPhonePeStatus(TransactionDto transactionDto) {
+    String phonePeMid = resolvePhonePeMerchantId(transactionDto.getMerchantId());
+    String path = phonePeUtil.buildStatusPath(properties.getStatusPath(), phonePeMid, transactionDto.getAtrnNum());
+    String xVerify = phonePeUtil.statusChecksum(path, properties.getSaltKey(), properties.getSaltIndex());
+    HashMap<String, String> headers = phonePeUtil.createStatusApiRequestHeader(xVerify, phonePeMid);
+    String response = phonePeWebClientService.initiateWebClient(HttpMethod.GET,
+            properties.getStatusBaseUrl() + path, null, String.class, headers);
+    logger.info("PhonePe status response for ATRN {} : {}", transactionDto.getAtrnNum(), response);
+    try {
+        return objectMapper.readValue(response, PhonePeTransactionStatusResponse.class);
+    } catch (Exception e) {
+        throw new PaymentException(PaymentConstants.EXTERNAL_SERVICE_ERROR_CODE, "Invalid PhonePe status response");
+    }
+}
+
+/** Same merchant id that was used in the debit: row from the DB table, else the default from properties. */
+private String resolvePhonePeMerchantId(String sbiMerchantId) {
+    return phonePeMidDao.findActiveByMerchantId(sbiMerchantId)
+            .map(PhonePeMerchantMid::getPhonePeMid)
+            .orElse(properties.getMerchantId());
+}
+
+private PhonePeWebhookResponse convertWebhookToDto(String rawBody) {
+    try {
+        PhonePeWebhookResponse dto = objectMapper.readValue(rawBody, PhonePeWebhookResponse.class);
+        if (dto == null || dto.getData() == null || dto.getData().getTransactionId() == null) {
+            throw new PaymentException(PaymentConstants.EXTERNAL_SERVICE_ERROR_CODE, "Invalid PhonePe webhook body");
+        }
+        return dto;
+    } catch (PaymentException e) {
+        throw e;
+    } catch (Exception e) {
+        throw new PaymentException(PaymentConstants.EXTERNAL_SERVICE_ERROR_CODE, "Invalid PhonePe webhook body");
+    }
+}
+
+/** Same fields as your getRedirectObject. */
+private PaymentFinalResponse getPhonePeFinalResponse(TransactionDto transactionDto, PhonePeVerifyResult result) {
+    Order order = orderDao.getOrderDetails(transactionDto);
+    String channelStatus = result.state() == PhonePePaymentState.SUCCESS
+            ? PaymentConstants.SUCCESS : PaymentConstants.FAILED;
+    FinalResponseStatus finalResponseStatus = getStatus(transactionDto, order, channelStatus,
+            result.message() == null ? PaymentConstants.EMPTY : result.message());
+    return PaymentFinalResponse.builder()
+            .mId(val(transactionDto.getMerchantId()))
+            .merchantOrderNumber(val(transactionDto.getOrderRefNumber()))
+            .sbiOrderId(val(transactionDto.getSbiOrderRefNumber()))
+            .orderAmount(val(transactionDto.getOrderAmount()))
+            .totalAmount(val(transactionDto.getDebitAmt()))
+            .atrn(val(transactionDto.getAtrnNum()))
+            .transactionStatus(finalResponseStatus.getStatus())
+            .reason(finalResponseStatus.getResponseReason())
+            .CIN(val(transactionDto.getCin()))
+            .otherDetails(val(order.getOtherDetails()))
+            .bankName(val(transactionDto.getChannelBank()))
+            .bankTxnNumber(val(result.providerRef()))
+            .bankCode(val(transactionDto.getPayMode()))
+            .customerId(val(order.getCustomerId()))
+            .orderRetryCount(val(order.getOrderRetryCount()))
+            .build();
+}
+
+private FinalResponseStatus getStatus(TransactionDto transactionDto, Order order, String channelStatus, String failureReason) {
+    if (!transactionDto.getOrderAmount().equals(order.getOrderAmount())) {
+        return FinalResponseStatus.builder().status(PaymentConstants.FAILED)
+                .responseReason(PaymentConstants.FAILED_FOR_AMOUNT_NOT_MATCHED).build();
+    }
+    return FinalResponseStatus.builder().status(channelStatus)
+            .responseReason(failureReason.replaceAll(PaymentConstants.SPECIAL_CHAR_REGEX, PaymentConstants.EMPTY)).build();
+}
+
+private String val(Object o) {
+    return o == null ? PaymentConstants.EMPTY : String.valueOf(o);
+}
+
+public record PhonePeVerifyResult(PhonePePaymentState state, String message, String providerRef) { }
+
+
+
+
+
+
+
+
+// PhonePeUtil
+public HashMap<String, String> createStatusApiRequestHeader(String xVerify, String merchantId) {
+    HashMap<String, String> headers = new HashMap<>();
+    headers.put(PaymentConstants.REQUESTPROPERTY, PaymentConstants.APPLICATION_JSON);
+    headers.put(PaymentConstants.PHONE_PE_X_VERIFY, xVerify);
+    headers.put("X-MERCHANT-ID", merchantId);
+    return headers;
+}
+
+// PhonePeUtil: state for a transaction that is already final
+public static PhonePePaymentState toFinalState(TransactionDto dto) {
+    return PaymentConstants.SUCCESS.equalsIgnoreCase(dto.getTransactionStatus())
+            ? PhonePePaymentState.SUCCESS : PhonePePaymentState.FAILED;
+}
+
+
+
+
+
+@PostMapping("/phonepecallback")                    // PhonePe calls this. Must be open without login.
+public ResponseEntity<String> phonePeWebhook(@RequestBody String rawBody) {
+    phonePeService.processPhonePeWebhook(rawBody);
+    return ResponseEntity.ok("OK");
+}
+
+@GetMapping("/phonepe-return")                      // user comes back; front end calls this
+public RedirectView phonePeReturn(@RequestParam("atrn") String atrn) {
+    PaymentRequest request = new PaymentRequest();
+    request.setAtrn(atrn);
+    return phonePeService.processPhonePeReturn(request);
+}
+
+
+
+
