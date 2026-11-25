@@ -1,0 +1,482 @@
+package com.epay.otherinb.util.encryptdecryptutil;
+
+import com.epay.otherinb.dao.OtherInbPaymentDao;
+import com.epay.otherinb.dto.OtherInbChannelUnitMappingDto;
+import com.epay.otherinb.dto.TransactionDto;
+import com.epay.otherinb.entity.OtherInbPostingData;
+import com.epay.otherinb.entity.PostingData;
+import com.epay.otherinb.exceptions.OtherInbPaymentException;
+import com.epay.otherinb.model.request.PaymentRequest;
+import com.epay.otherinb.util.constants.OtherInbConstants;
+import com.sbi.epay.logging.utility.LoggerFactoryUtility;
+import com.sbi.epay.logging.utility.LoggerUtility;
+import lombok.RequiredArgsConstructor;
+import org.apache.commons.lang3.StringUtils;
+import org.springframework.stereotype.Component;
+
+import javax.crypto.Cipher;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
+import java.security.MessageDigest;
+import java.security.SecureRandom;
+import java.util.Arrays;
+import java.util.Base64;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * Class Name: IobEncryptionDecryptionUtil
+ * <p>
+ * Description: IOB (Indian Overseas Bank) integration utility for SBIePay.
+ * Flow (per "SBIEPAY ChannelBanks Integration Guide"):
+ * 1. processInitiate        - checksum -> plain web request -> AES/GCM encrypt -> auto-submit HTML form
+ * 2. processWebResponse     - decrypt bank response (posted to RU) and verify checksum
+ * 3. createDoubleVerificationRequest   - server-to-server DV request (encData param)
+ * 4. processDoubleVerificationResponse - decrypt DV response and verify checksum
+ * <p>
+ * Everything is driven by the OINB_CHANNEL_UNIT_MAPPING row of the IOB unit:
+ * <pre>
+ *  WEB_REQUEST_FORMAT   MD={0}|PID={1}|NAR={2}|PRN={3}|AMT={4}|CRN={5}|RU={6}|ACCNO={7}|checkval={8}
+ *  VERI_REQUEST_FORMAT  MD={0}|PID={1}|PRN={2}|AMT={3}|NAR={4}|BID={5}|CRN={6}|checkval={7}
+ *  CHECKSUM_VALUE       {0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}|[CHECKSUM KEY]     (key = literal text after the last placeholder)
+ *  WEB_ENC_KEY          Base64 AES-256 key (32 bytes)
+ *  VERI_EN_CKEY         Base64 AES-256 key for DV (falls back to WEB_ENC_KEY when blank)
+ *  BANK_URL             IOB merchant login URL (form action)
+ *  CHANNEL_RETURN_URL   SBIePay return URL (RU)
+ *  FORM_POSTING_TEMPLATE Base64 HTML with ${ACTION_URL}, ${METHOD}, ${PID}, ${ENC_DATA} (optional, default used if blank)
+ *  FROM_POSTING_METHOD  POST (default)
+ * </pre>
+ * Version: 1.0
+ */
+@Component("IobEncryptionDecryptionUtil")
+@RequiredArgsConstructor
+public class IobEncryptionDecryptionUtil {
+
+    private final LoggerUtility logger = LoggerFactoryUtility.getLogger(this.getClass());
+    private final OtherInbPaymentDao otherInbPaymentDao;
+
+    // ---- protocol constants -------------------------------------------------------------
+    private static final String PIPE = "|";
+    private static final String PIPE_REGEX = "\\|";
+    private static final String NA = "NA";
+    private static final String MODE_PAYMENT = "P";
+    private static final String MODE_VERIFY = "V";
+    private static final String DEFAULT_CURRENCY = "INR";
+    private static final String DEFAULT_FORM_METHOD = "POST";
+    private static final String CHECKVAL = "CHECKVAL";
+
+    private static final int PID_LENGTH = 11;
+    private static final int NAR_MAX_LENGTH = 16;
+
+    /** Field order used to build the checksum of the bank's web response: STATUS|PRN|NAR|BID|AMT|ACCNO|Key */
+    private static final String[] WEB_RESPONSE_FIELDS = {"STATUS", "PRN", "NAR", "BID", "AMT", "ACCNO"};
+    /** Field order used to build the checksum of the bank's DV response: STATUS|PRN|AMT|BID|Key */
+    private static final String[] DV_RESPONSE_FIELDS = {"STATUS", "PRN", "AMT", "BID"};
+
+    // ---- crypto constants ---------------------------------------------------------------
+    private static final String CIPHER_TRANSFORMATION = "AES/GCM/NoPadding";
+    private static final int GCM_IV_LENGTH = 12;
+    private static final int GCM_TAG_BITS = 128;
+    private static final int AES_256_KEY_BYTES = 32;
+    private static final SecureRandom SECURE_RANDOM = new SecureRandom();
+
+    private static final Pattern PLACEHOLDER = Pattern.compile("\\{(\\d+)}");
+
+    // ---- error codes (move to ErrorConstants if you prefer) -----------------------------
+    private static final String IOB_CONFIG_ERROR_CODE = "IOB_CONFIG_ERROR";
+    private static final String IOB_CRYPTO_ERROR_CODE = "IOB_CRYPTO_ERROR";
+    private static final String IOB_RESPONSE_ERROR_CODE = "IOB_RESPONSE_ERROR";
+    private static final String IOB_CHECKSUM_ERROR_CODE = "IOB_CHECKSUM_MISMATCH";
+
+    private static final String DEFAULT_FORM_TEMPLATE =
+            "<html><body onload=\"document.forms[0].submit()\">"
+                    + "<form action=\"${ACTION_URL}\" method=\"${METHOD}\">"
+                    + "<input type=\"hidden\" name=\"PID\" value=\"${PID}\"/>"
+                    + "<input type=\"hidden\" name=\"data\" value=\"${ENC_DATA}\"/>"
+                    + "<noscript><input type=\"submit\" value=\"Continue\"/></noscript>"
+                    + "</form></body></html>";
+
+    // =======================================================================================
+    // 1. PAYMENT INITIATE (SBIePay -> IOB)
+    // =======================================================================================
+
+    public OtherInbPostingData processInitiate(PaymentRequest paymentWebRequest,
+                                               TransactionDto transactionDto,
+                                               OtherInbChannelUnitMappingDto otherInbChannelUnitMappingDto) throws Exception {
+        // Step 1: checksum over the plain checksum string (contains the checksum key, never logged)
+        String checksum = sha256Hex(createChecksumRequest(transactionDto, otherInbChannelUnitMappingDto));
+        logger.info("IOB checksum generated for atrn {}", transactionDto.getAtrnNum());
+
+        // Step 2: plain web request + checksum
+        String plainTextWebReqData = createWebRequest(transactionDto, otherInbChannelUnitMappingDto, checksum);
+        logger.info("IOB plainTextWebReqData. {}", plainTextWebReqData);
+        otherInbPaymentDao.saveRequestLog(plainTextWebReqData, paymentWebRequest.getAtrn(),
+                OtherInbConstants.WEB_REQUEST_TYPE, OtherInbConstants.CREATED_BY_BOIR);
+
+        // Step 3: encrypt and build the auto-submit form
+        PostingData postingData = encryptedPostedData(plainTextWebReqData, otherInbChannelUnitMappingDto, transactionDto);
+        String formHtml = getFormPostingIobData(postingData, otherInbChannelUnitMappingDto, transactionDto);
+
+        return OtherInbPostingData.builder()
+                .atrn(transactionDto.getAtrnNum())
+                .merchIdVal(transactionDto.getMerchantId())
+                .encryptTrans(formHtml)
+                .build();
+    }
+
+    /** Plain checksum string: P|PID|NAR|PRN|AMT|CRN|RU|ACCNO|ChecksumKey (shape comes from CHECKSUM_VALUE). */
+    public String createChecksumRequest(TransactionDto transactionDto, OtherInbChannelUnitMappingDto dto) {
+        return applyTemplate(dto.getChecksumValue(), requestArgs(transactionDto, dto));
+    }
+
+    /** Plain web request: MD=P|PID=..|NAR=..|PRN=..|AMT=..|CRN=..|RU=..|ACCNO=..|checkval=.. */
+    public String createWebRequest(TransactionDto transactionDto, OtherInbChannelUnitMappingDto dto, String checkValue) {
+        String[] args = Arrays.copyOf(requestArgs(transactionDto, dto), 9);
+        args[8] = checkValue;
+        return applyTemplate(dto.getWebRequestFormat(), args);
+    }
+
+    public PostingData encryptedPostedData(String plainTextWebReqData,
+                                           OtherInbChannelUnitMappingDto dto,
+                                           TransactionDto transactionDto) {
+        String encWebReqData = encrypt(plainTextWebReqData, dto.getWebEncKey());
+        return PostingData.builder()
+                .data(encWebReqData)
+                .atrn(transactionDto.getAtrnNum())
+                .build();
+    }
+
+    /** Builds the HTML form (Base64 encoded, same contract as the Kalupur util) that posts PID + data to IOB. */
+    public String getFormPostingIobData(PostingData encryptedPostedData,
+                                        OtherInbChannelUnitMappingDto dto,
+                                        TransactionDto transactionDto) {
+        String template = StringUtils.isBlank(dto.getFormPostingTemplate())
+                ? DEFAULT_FORM_TEMPLATE
+                : new String(Base64.getDecoder().decode(dto.getFormPostingTemplate()), StandardCharsets.UTF_8);
+
+        Map<String, String> values = new LinkedHashMap<>();
+        values.put("ACTION_URL", dto.getBankUrl());
+        values.put("METHOD", StringUtils.defaultIfBlank(dto.getFormPostingMethod(), DEFAULT_FORM_METHOD));
+        values.put("PID", resolvePid(transactionDto));
+        values.put("ENC_DATA", encryptedPostedData.getData());
+
+        String html = fillFormTemplate(template, values);
+        return Base64.getEncoder().encodeToString(html.getBytes(StandardCharsets.UTF_8));
+    }
+
+    // =======================================================================================
+    // 2. WEB RESPONSE (IOB -> SBIePay, posted to RU as data=<encrypted>)
+    // =======================================================================================
+
+    /**
+     * Decrypts the bank web response, validates its checksum and returns the parsed fields
+     * (keys upper-case: STATUS, PRN, NAR, BID, AMT, ACCNO, ERRORMSG ...).
+     */
+    public Map<String, String> processWebResponse(String encryptedResponse, OtherInbChannelUnitMappingDto dto) {
+        String plain = decrypt(encryptedResponse, dto.getWebEncKey());
+        logger.info("IOB decrypted web response. {}", plain);
+
+        Map<String, String> response = parseResponse(plain, null);
+        response.putIfAbsent("ACCNO", NA);
+        verifyResponseChecksum(response, WEB_RESPONSE_FIELDS, dto);
+        return response;
+    }
+
+    // =======================================================================================
+    // 3. DOUBLE VERIFICATION (SBIePay -> IOB, server to server, param encData=<returned value>)
+    // =======================================================================================
+
+    /**
+     * @param bankRefId BID received in the web response; pass null/blank on a drop journey (sent as NA).
+     * @return encrypted DV request to be sent as {@code encData} to DV_URL
+     */
+    public String createDoubleVerificationRequest(TransactionDto transactionDto,
+                                                  OtherInbChannelUnitMappingDto dto,
+                                                  String bankRefId) {
+        String bid = StringUtils.defaultIfBlank(bankRefId, NA);
+        String[] args = {
+                MODE_VERIFY,
+                resolvePid(transactionDto),
+                transactionDto.getAtrnNum(),
+                formatAmount(transactionDto.getDebitAmt()),
+                resolveBillerName(dto),
+                bid,
+                resolveCurrency(transactionDto)
+        };
+
+        // V|PID|PRN|AMT|NAR|BID|CRN|ChecksumKey
+        String checksum = sha256Hex(String.join(PIPE, args) + PIPE + checksumKey(dto));
+
+        String[] full = Arrays.copyOf(args, 8);
+        full[7] = checksum;
+        String plainDvRequest = applyTemplate(dto.getVeriRequestFormat(), full);
+        logger.info("IOB plain DV request. {}", plainDvRequest);
+
+        return encrypt(plainDvRequest, resolveVeriKey(dto));
+    }
+
+    // =======================================================================================
+    // 4. DV RESPONSE (IOB -> SBIePay)
+    // =======================================================================================
+
+    /** Decrypts the DV response, validates its checksum and returns the parsed fields (STATUS, PRN, AMT, BID ...). */
+    public Map<String, String> processDoubleVerificationResponse(String encryptedResponse,
+                                                                 OtherInbChannelUnitMappingDto dto) {
+        String plain = decrypt(encryptedResponse, resolveVeriKey(dto));
+        logger.info("IOB decrypted DV response. {}", plain);
+
+        // IOB sample DV response is positional (Y|PRN|AMT|BID|checkval=..); keyed form is also accepted.
+        Map<String, String> response = parseResponse(plain, DV_RESPONSE_FIELDS);
+        verifyResponseChecksum(response, DV_RESPONSE_FIELDS, dto);
+        return response;
+    }
+
+    // =======================================================================================
+    // Crypto + checksum primitives
+    // =======================================================================================
+
+    public String sha256Hex(String input) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            return toHex(digest.digest(input.getBytes(StandardCharsets.UTF_8)));
+        } catch (GeneralSecurityException e) {
+            throw new OtherInbPaymentException(IOB_CRYPTO_ERROR_CODE, "Unable to generate IOB checksum");
+        }
+    }
+
+    /** AES/GCM/NoPadding, random 12-byte IV prepended to the cipher text, Base64 encoded. */
+    public String encrypt(String plainText, String base64Key) {
+        try {
+            byte[] iv = new byte[GCM_IV_LENGTH];
+            SECURE_RANDOM.nextBytes(iv);
+            Cipher cipher = Cipher.getInstance(CIPHER_TRANSFORMATION);
+            cipher.init(Cipher.ENCRYPT_MODE, toSecretKey(base64Key), new GCMParameterSpec(GCM_TAG_BITS, iv));
+            byte[] cipherText = cipher.doFinal(plainText.getBytes(StandardCharsets.UTF_8));
+
+            ByteBuffer buffer = ByteBuffer.allocate(iv.length + cipherText.length);
+            buffer.put(iv);
+            buffer.put(cipherText);
+            return Base64.getEncoder().encodeToString(buffer.array());
+        } catch (GeneralSecurityException e) {
+            logger.info("IOB encrypt failed :: {}", e.getMessage());
+            throw new OtherInbPaymentException(IOB_CRYPTO_ERROR_CODE, "Unable to encrypt IOB request");
+        }
+    }
+
+    public String decrypt(String encrypted, String base64Key) {
+        try {
+            byte[] decoded = Base64.getDecoder().decode(encrypted.trim());
+            if (decoded.length <= GCM_IV_LENGTH) {
+                throw new IllegalArgumentException("Cipher text too short");
+            }
+            ByteBuffer buffer = ByteBuffer.wrap(decoded);
+            byte[] iv = new byte[GCM_IV_LENGTH];
+            buffer.get(iv);
+            byte[] cipherText = new byte[buffer.remaining()];
+            buffer.get(cipherText);
+
+            Cipher cipher = Cipher.getInstance(CIPHER_TRANSFORMATION);
+            cipher.init(Cipher.DECRYPT_MODE, toSecretKey(base64Key), new GCMParameterSpec(GCM_TAG_BITS, iv));
+            return new String(cipher.doFinal(cipherText), StandardCharsets.UTF_8);
+        } catch (GeneralSecurityException | IllegalArgumentException e) {
+            logger.info("IOB decrypt failed :: {}", e.getMessage());
+            throw new OtherInbPaymentException(IOB_CRYPTO_ERROR_CODE, "Unable to decrypt IOB response");
+        }
+    }
+
+    // =======================================================================================
+    // Helpers
+    // =======================================================================================
+
+    /** Order must match WEB_REQUEST_FORMAT / CHECKSUM_VALUE placeholders: MD, PID, NAR, PRN, AMT, CRN, RU, ACCNO. */
+    private String[] requestArgs(TransactionDto transactionDto, OtherInbChannelUnitMappingDto dto) {
+        return new String[]{
+                MODE_PAYMENT,
+                resolvePid(transactionDto),
+                resolveBillerName(dto),
+                transactionDto.getAtrnNum(),
+                formatAmount(transactionDto.getDebitAmt()),
+                resolveCurrency(transactionDto),
+                dto.getChannelReturnUrl(),
+                NA
+        };
+    }
+
+    /** PID: bank-defined payee id, 11 digits, left padded with zeros. */
+    private String resolvePid(TransactionDto transactionDto) {
+        String pid = StringUtils.trimToEmpty(String.valueOf(transactionDto.getMerchantId()));
+        if (pid.isEmpty() || "null".equals(pid)) {
+            throw new OtherInbPaymentException(IOB_CONFIG_ERROR_CODE, "IOB payee id (PID) is missing");
+        }
+        return StringUtils.leftPad(pid, PID_LENGTH, '0');
+    }
+
+    /** NAR: biller name, max 16 chars, taken from UNIT_NAME of the mapping row. */
+    private String resolveBillerName(OtherInbChannelUnitMappingDto dto) {
+        if (StringUtils.isBlank(dto.getUnitName())) {
+            throw new OtherInbPaymentException(IOB_CONFIG_ERROR_CODE, "IOB biller name (UNIT_NAME) is missing");
+        }
+        return StringUtils.left(dto.getUnitName().trim(), NAR_MAX_LENGTH);
+    }
+
+    private String resolveCurrency(TransactionDto transactionDto) {
+        return StringUtils.defaultIfBlank(transactionDto.getCurrencyCode(), DEFAULT_CURRENCY);
+    }
+
+    /** Amount with exactly 2 decimals, e.g. 2333.04 */
+    private String formatAmount(Object amount) {
+        try {
+            return new BigDecimal(String.valueOf(amount).trim()).setScale(2, RoundingMode.HALF_UP).toPlainString();
+        } catch (NumberFormatException e) {
+            throw new OtherInbPaymentException(IOB_CONFIG_ERROR_CODE, "Invalid IOB transaction amount");
+        }
+    }
+
+    private String resolveVeriKey(OtherInbChannelUnitMappingDto dto) {
+        return StringUtils.isNotBlank(dto.getVeriEnCkey()) ? dto.getVeriEnCkey() : dto.getWebEncKey();
+    }
+
+    /** The checksum key is the literal text after the last {n} placeholder of CHECKSUM_VALUE. */
+    private String checksumKey(OtherInbChannelUnitMappingDto dto) {
+        String template = StringUtils.trimToEmpty(dto.getChecksumValue());
+        String key = StringUtils.removeStart(template.substring(template.lastIndexOf('}') + 1), PIPE).trim();
+        if (key.isEmpty()) {
+            throw new OtherInbPaymentException(IOB_CONFIG_ERROR_CODE,
+                    "IOB CHECKSUM_VALUE must end with the checksum key");
+        }
+        return key;
+    }
+
+    private SecretKey toSecretKey(String base64Key) {
+        if (StringUtils.isBlank(base64Key)) {
+            throw new OtherInbPaymentException(IOB_CONFIG_ERROR_CODE, "IOB encryption key is not configured");
+        }
+        byte[] keyBytes = Base64.getDecoder().decode(base64Key.trim());
+        if (keyBytes.length != AES_256_KEY_BYTES) {
+            throw new OtherInbPaymentException(IOB_CONFIG_ERROR_CODE, "IOB encryption key must be 256 bits");
+        }
+        return new SecretKeySpec(keyBytes, "AES");
+    }
+
+    /**
+     * Parses "KEY=value|KEY=value|checkval=xyz". When positionalNames is given, tokens without '='
+     * are assigned to those names in order (IOB's positional DV response).
+     */
+    private Map<String, String> parseResponse(String plain, String[] positionalNames) {
+        Map<String, String> map = new LinkedHashMap<>();
+        if (StringUtils.isBlank(plain)) {
+            throw new OtherInbPaymentException(IOB_RESPONSE_ERROR_CODE, "Empty IOB response");
+        }
+        String[] tokens = plain.split(PIPE_REGEX);
+        for (int i = 0; i < tokens.length; i++) {
+            String token = tokens[i];
+            int idx = token.indexOf('=');
+            if (idx > 0) {
+                map.put(token.substring(0, idx).trim().toUpperCase(), blankToNa(token.substring(idx + 1)));
+            } else if (positionalNames != null && i < positionalNames.length) {
+                map.put(positionalNames[i], blankToNa(token));
+            }
+        }
+        if (map.size() < 2 || !map.containsKey(CHECKVAL)) {
+            throw new OtherInbPaymentException(IOB_RESPONSE_ERROR_CODE, "Malformed IOB response");
+        }
+        return map;
+    }
+
+    /** Checksum = SHA-256( v1|v2|...|vN|ChecksumKey ), compared in constant time. */
+    private void verifyResponseChecksum(Map<String, String> response, String[] fields,
+                                        OtherInbChannelUnitMappingDto dto) {
+        StringBuilder sb = new StringBuilder();
+        for (String field : fields) {
+            String value = response.get(field);
+            if (value == null) {
+                throw new OtherInbPaymentException(IOB_RESPONSE_ERROR_CODE, "IOB response missing field " + field);
+            }
+            sb.append(value).append(PIPE);
+        }
+        sb.append(checksumKey(dto));
+
+        String expected = sha256Hex(sb.toString());
+        String received = StringUtils.trimToEmpty(response.get(CHECKVAL)).toLowerCase();
+        boolean matches = MessageDigest.isEqual(
+                expected.getBytes(StandardCharsets.UTF_8), received.getBytes(StandardCharsets.UTF_8));
+        if (!matches) {
+            logger.info("IOB response checksum mismatch for PRN {}", response.get("PRN"));
+            throw new OtherInbPaymentException(IOB_CHECKSUM_ERROR_CODE, "IOB response checksum verification failed");
+        }
+    }
+
+    /** Single-pass {n} substitution (no MessageFormat quote / number-format surprises). */
+    private static String applyTemplate(String template, String... args) {
+        if (StringUtils.isBlank(template)) {
+            throw new OtherInbPaymentException(IOB_CONFIG_ERROR_CODE, "IOB message format is not configured");
+        }
+        Matcher matcher = PLACEHOLDER.matcher(template);
+        StringBuffer out = new StringBuffer();
+        while (matcher.find()) {
+            int index = Integer.parseInt(matcher.group(1));
+            if (index >= args.length) {
+                throw new OtherInbPaymentException(IOB_CONFIG_ERROR_CODE, "IOB format placeholder {" + index + "} has no value");
+            }
+            matcher.appendReplacement(out, Matcher.quoteReplacement(StringUtils.defaultString(args[index])));
+        }
+        matcher.appendTail(out);
+        return out.toString();
+    }
+
+    private static String fillFormTemplate(String template, Map<String, String> values) {
+        String result = template;
+        for (Map.Entry<String, String> entry : values.entrySet()) {
+            result = result.replace("${" + entry.getKey() + "}", escapeHtml(entry.getValue()));
+        }
+        return result;
+    }
+
+    private static String escapeHtml(String value) {
+        return StringUtils.defaultString(value)
+                .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                .replace("\"", "&quot;").replace("'", "&#39;");
+    }
+
+    private static String blankToNa(String value) {
+        return StringUtils.isBlank(value) ? NA : value.trim();
+    }
+
+    private static String toHex(byte[] bytes) {
+        StringBuilder sb = new StringBuilder(bytes.length * 2);
+        for (byte b : bytes) {
+            sb.append(String.format("%02x", b));
+        }
+        return sb.toString();
+    }
+}
+
+
+
+
+
+
+
+
+UPDATE OINB_CHANNEL_UNIT_MAPPING SET
+  WEB_REQUEST_FORMAT  = 'MD={0}|PID={1}|NAR={2}|PRN={3}|AMT={4}|CRN={5}|RU={6}|ACCNO={7}|checkval={8}',
+  WEB_RESPONSE_FORMAT = 'STATUS={0}|PRN={1}|NAR={2}|BID={3}|AMT={4}|ACCNO={5}|checkval={6}',
+  VERI_REQUEST_FORMAT = 'MD={0}|PID={1}|PRN={2}|AMT={3}|NAR={4}|BID={5}|CRN={6}|checkval={7}',
+  VERI_RESPONSE_FORMAT = 'STATUS={0}|PRN={1}|AMT={2}|BID={3}|checkval={4}',
+  CHECKSUM_VALUE      = '{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}|<CHECKSUM_KEY_FROM_IOB>',
+  WEB_ENC_KEY         = '<BASE64_256BIT_KEY_FROM_IOB>',
+  VERI_EN_CKEY        = '<BASE64_256BIT_KEY_FROM_IOB>',
+  COMMON_ENC_KEY      = 'NA',
+  COMMON_ENC_KEY_IV   = 'NA',
+  WEB_ENC_KEYIV       = 'NA',
+  VERI_ENC_KEY_IV     = 'NA'
+WHERE GTW_MAP_ID = '<IOB_GTW_MAP_ID>';
+COMMIT;
